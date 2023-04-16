@@ -1,0 +1,6 @@
+rm -rf *.o  botsalgn.out
+find . \( -name \*.o -o -name '*.fppized.f*' -o -name '*.i' -o -name '*.mod' \) -print | xargs rm -rf
+rm -rf bots-alignment
+rm -rf bots-alignment.exe
+rm -rf core
+rm -rf 

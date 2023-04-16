@@ -1,0 +1,2 @@
+run_base_test_Sept.12.3.0000 dir=/home/bhchen/hw/omp2012-1.1.iso/benchspec/OMP2012/358.botsalgn/run/run_base_test_Sept.12.3.0000 ext=Sept.12.3 lock=0 mach=default size=test tune=base type=run username=bhchen
+__END__
