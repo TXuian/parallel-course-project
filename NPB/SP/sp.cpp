@@ -55,9 +55,12 @@ Authors of the OpenMP code:
 	
 */
 
-#include "omp.h"
 #include "../common/npb-CPP.hpp"
 #include "npbparams.hpp"
+#include "omp.h"
+#include "mpi.h"
+#include <string.h>
+// #include <memory>
 
 #define IMAX PROBLEM_SIZE
 #define JMAX PROBLEM_SIZE
@@ -146,6 +149,87 @@ static double tx1, tx2, tx3,ty1, ty2, ty3, tz1, tz2, tz3,
 static int grid_points[3], nx2, ny2, nz2;
 static boolean timeron;
 
+namespace MpiToolKit{
+// singleton communicator for MPI
+class Communicator {
+public:
+  	int world_size;
+  	int world_rank;
+};
+
+static Communicator& getCommunicator() {
+	static Communicator comm;
+	return comm;
+} 
+
+// #define printf if(getCommunicator().world_rank==0) printf
+
+inline void init_mpi() {
+	MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, NULL);
+
+	// init communicator
+  	MPI_Comm_size(MPI_COMM_WORLD, &getCommunicator().world_size);
+  	MPI_Comm_rank(MPI_COMM_WORLD, &getCommunicator().world_rank);
+
+	printf("Current Process: %d.\n", getCommunicator().world_rank);
+}
+
+inline int block_begin(int rank, int partition_size) {
+	return max(rank * partition_size, 0) + 1;
+}
+
+inline int block_end(int rank, int partition_size, int n) {
+	return min((rank + 1) * partition_size, n);
+}
+
+inline bool is_in_block(const int idx, const int begin, const int end) {
+	return begin <= idx && idx <= end;
+}
+
+template <typename Fn_, typename... Args>
+inline void block_run(const int k, const int j, const int i, 
+					const int begin_z, const int end_z, 
+					const int begin_y, const int end_y,
+					const int begin_x, const int end_x,
+					Fn_&& fn, Args&&... args) {
+	if (is_in_block(k, begin_z, end_z) &&
+		is_in_block(j, begin_y, end_y) &&
+		is_in_block(i, begin_x, end_x)) {
+		// run func
+		fn(args...);
+	}
+}
+
+inline void partition(int& partition_size, int& begin, int& end, int n) {
+  	partition_size = static_cast<int>(ceil(n * 1.0 / getCommunicator().world_size));
+  	begin = block_begin(getCommunicator().world_rank, partition_size);
+  	end = block_end(getCommunicator().world_rank, partition_size, n);
+}
+
+template <typename array_t>
+inline void sync_buffer(array_t* buffer, int begin, int end, int partition_size, int start, int scale) {
+	if(getCommunicator().world_rank == 0) {
+		for(int i = 1; i < getCommunicator().world_size; i++) {
+			int recv_begin = block_begin(i, partition_size),
+				recv_size = (block_end(i, partition_size, scale) - recv_begin + 1) * sizeof(array_t) / sizeof(double);
+			MPI_Recv(&buffer[recv_begin], recv_size, MPI_DOUBLE, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		}
+	} else {
+		intptr_t send_size = (end - begin + 1) * sizeof(array_t) / sizeof(double);
+		MPI_Send(&buffer[begin], send_size, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD);
+	}
+
+	int buffer_size = scale * sizeof(array_t) / sizeof(double);
+	MPI_Bcast(&buffer[start], buffer_size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+}
+
+} // namespace MpiToolKit
+
+using MpiToolKit::getCommunicator;
+using MpiToolKit::partition;
+using MpiToolKit::sync_buffer;
+using MpiToolKit::block_run;
+
 /* function prototypes */
 void add();
 void adi();
@@ -172,6 +256,11 @@ int main(int argc, char* argv[]){
 #if defined(DO_NOT_ALLOCATE_ARRAYS_WITH_DYNAMIC_MEMORY_AND_AS_SINGLE_DIMENSION)
 	printf(" DO_NOT_ALLOCATE_ARRAYS_WITH_DYNAMIC_MEMORY_AND_AS_SINGLE_DIMENSION mode on\n");
 #endif
+	MpiToolKit::init_mpi();
+	if(argc >= 2) {
+		omp_set_num_threads(atoi(argv[1]));
+	}
+
 	int i, niter, step, n3;
 	double mflops, t, tmax, trecs[T_LAST+1];
 	boolean verified;
@@ -243,22 +332,15 @@ int main(int argc, char* argv[]){
 	 * do one time step to touch all code, and reinitialize
 	 * ---------------------------------------------------------------------
 	 */
-	#pragma omp parallel
-  	{
-		adi();
-	}
+	adi();
 	initialize();
 	for(i=1;i<=T_LAST;i++){timer_clear(i);}
 	timer_start(1);
-	#pragma omp parallel firstprivate(niter) private(step)
-  	{
-		for(step=1;step<=niter;step++){
-			if((step%20)==0||step==1){
-				#pragma omp master
-					printf(" Time step %4d\n",step);
-			}
-			adi();
+	for(step=1; step<=niter; step++){
+		if((step%20)==0||step==1){
+				printf(" Time step %4d\n",step);
 		}
+		adi();
 	}
 	timer_stop(1);
 	tmax=timer_read(1);
@@ -323,6 +405,8 @@ int main(int argc, char* argv[]){
 			}
 		}
 	}
+
+  	MPI_Finalize();
 	return 0;
 }
 
@@ -336,8 +420,12 @@ void add(){
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_ADD);}
-	#pragma omp for
-	for(k=1; k<=nz2; k++){
+	
+	int begin, end, partition_size, scale = nz2;
+	partition(partition_size, begin, end, scale);
+
+	#pragma omp parallel for
+	for(k=begin; k<=end; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
 				for(m=0; m<5; m++){
@@ -346,6 +434,9 @@ void add(){
 			}
 		}
 	}
+	sync_buffer(u, begin, end, partition_size, 1, scale);
+
+
 	if(timeron && thread_id==0){timer_stop(T_ADD);}
 }
 
@@ -364,33 +455,75 @@ void compute_rhs(){
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_RHS);}
+
+	int scale_z = KMAX, partition_size_z = 0, begin_z = 0, end_z = scale_z;
+	int scale_y = JMAXP + 1, partition_size_y = 0, begin_y = 0, end_y = scale_y;
+	int scale_x = IMAXP + 1, begin_x = 0, end_x = scale_x;
+	// partition(partition_size_y, begin_y, end_y, scale_y);
+	// partition(partition_size_z, begin_z, end_z, scale_z);
+
 	/*
 	 * ---------------------------------------------------------------------
 	 * compute the reciprocal of density, and the kinetic energy, 
 	 * and the speed of sound. 
 	 * ---------------------------------------------------------------------
 	 */
-	#pragma omp for
+	#pragma omp parallel for
+	// global: u, rho_i, us, vs, ws, square, qs, c1c2, speed 
+	/// Input: 	u[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1][0:3]
+	///			c1c2
+	///			------------------------------------------------------------------
+	/// Output: rho_i[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
+	/// 		us[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
+	/// 		vs[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
+	/// 		ws[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
+	/// 		square[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
+	/// 		qs[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
+	/// 		speed[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
 	for(k=0; k<=grid_points[2]-1; k++){
 		for(j=0; j<=grid_points[1]-1; j++){
 			for(i=0; i<=grid_points[0]-1; i++){
-				rho_inv=1.0/u[k][j][i][0];
-				rho_i[k][j][i]=rho_inv;
-				us[k][j][i]=u[k][j][i][1]*rho_inv;
-				vs[k][j][i]=u[k][j][i][2]*rho_inv;
-				ws[k][j][i]=u[k][j][i][3]*rho_inv;
-				square[k][j][i]=0.5*(
-						u[k][j][i][1]*u[k][j][i][1]+ 
-						u[k][j][i][2]*u[k][j][i][2]+
-						u[k][j][i][3]*u[k][j][i][3])*rho_inv;
-				qs[k][j][i]=square[k][j][i]*rho_inv;
-				/*
-				 * ---------------------------------------------------------------------
-				 * (don't need speed and ainx until the lhs computation)
-				 * ---------------------------------------------------------------------
-				 */
-				aux=c1c2*rho_inv*(u[k][j][i][4]-square[k][j][i]);
-				speed[k][j][i]=sqrt(aux);
+				block_run(k, j, i, 
+					begin_z - 2, end_z + 2, 
+					begin_y - 2, end_y + 2,
+					begin_x - 2, end_x + 2,
+					[&](){
+						rho_inv=1.0/u[k][j][i][0];
+						rho_i[k][j][i]=rho_inv;
+						us[k][j][i]=u[k][j][i][1]*rho_inv;
+						vs[k][j][i]=u[k][j][i][2]*rho_inv;
+						ws[k][j][i]=u[k][j][i][3]*rho_inv;
+						square[k][j][i]=0.5*(
+								u[k][j][i][1]*u[k][j][i][1]+ 
+								u[k][j][i][2]*u[k][j][i][2]+
+								u[k][j][i][3]*u[k][j][i][3])*rho_inv;
+						qs[k][j][i]=square[k][j][i]*rho_inv;
+						/*
+						* ---------------------------------------------------------------------
+						* (don't need speed and ainx until the lhs computation)
+						* ---------------------------------------------------------------------
+						*/
+						aux=c1c2*rho_inv*(u[k][j][i][4]-square[k][j][i]);
+						speed[k][j][i]=sqrt(aux);
+					}
+				);
+				// rho_inv=1.0/u[k][j][i][0];
+				// rho_i[k][j][i]=rho_inv;
+				// us[k][j][i]=u[k][j][i][1]*rho_inv;
+				// vs[k][j][i]=u[k][j][i][2]*rho_inv;
+				// ws[k][j][i]=u[k][j][i][3]*rho_inv;
+				// square[k][j][i]=0.5*(
+				// 		u[k][j][i][1]*u[k][j][i][1]+ 
+				// 		u[k][j][i][2]*u[k][j][i][2]+
+				// 		u[k][j][i][3]*u[k][j][i][3])*rho_inv;
+				// qs[k][j][i]=square[k][j][i]*rho_inv;
+				// /*
+				//  * ---------------------------------------------------------------------
+				//  * (don't need speed and ainx until the lhs computation)
+				//  * ---------------------------------------------------------------------
+				//  */
+				// aux=c1c2*rho_inv*(u[k][j][i][4]-square[k][j][i]);
+				// speed[k][j][i]=sqrt(aux);
 			}
 		}
 	}
@@ -401,13 +534,25 @@ void compute_rhs(){
 	 * including the boundary                   
 	 * ---------------------------------------------------------------------
 	 */
-	#pragma omp for
+	#pragma omp parallel for
+	/// Input:	forcing[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1][0:4]
+	/// Output:	rhs[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1][0:4]
 	for(k=0; k<=grid_points[2]-1; k++){
 		for(j=0; j<=grid_points[1]-1; j++){
 			for(i=0; i<=grid_points[0]-1; i++){
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=forcing[k][j][i][m];
-				}
+				block_run(k, j, i,
+					begin_z - 2, end_z + 2,
+					begin_y - 2, end_y + 2,
+					begin_x - 2, end_x + 2,
+					[&](){
+						for(m=0; m<5; m++){
+							rhs[k][j][i][m]=forcing[k][j][i][m];
+						}
+					}
+				);
+				// for(m=0; m<5; m++){
+				// 	rhs[k][j][i][m]=forcing[k][j][i][m];
+				// }
 			}
 		}
 	}
@@ -417,39 +562,93 @@ void compute_rhs(){
 	 * ---------------------------------------------------------------------
 	 */
 	if(timeron && thread_id==0){timer_start(T_RHSX);}
-	#pragma omp for
+	#pragma omp parallel for
 	for(k=1; k<=nz2; k++){
+		/// Input:	us[1:nz2][1:ny2][1:nx2]
+		///			u[1:nz2][1:ny2][1:nx2][0:4]
+		///			rhs[1:nz2][1:ny2][1:nx2][0:4]
+		///			square[1:nz2][1:ny2][1:nx2]
+		///			vs[1:nz2][1:ny2][1:nx2]
+		///			ws[1:nz2][1:ny2][1:nx2]
+		///			qs[1:nz2][1:ny2][1:nx2]
+		///			rho_i[1:nz2][1:ny2][1:nx2]
+		///			dx1tx1 -> dx5tx1
+		///			xxcon2 -> xxcon5
+		///			tx2
+		///			c1, c2
+		/// Output:	rhs[1:nz2][1:ny2][1:nx2][0:4]
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
-				uijk=us[k][j][i];
-				up1=us[k][j][i+1];
-				um1=us[k][j][i-1];
-				rhs[k][j][i][0]=rhs[k][j][i][0]+dx1tx1* 
-					(u[k][j][i+1][0]-2.0*u[k][j][i][0]+u[k][j][i-1][0])-
-					tx2*(u[k][j][i+1][1]-u[k][j][i-1][1]);
-				rhs[k][j][i][1]=rhs[k][j][i][1]+dx2tx1* 
-					(u[k][j][i+1][1]-2.0*u[k][j][i][1]+u[k][j][i-1][1])+
-					xxcon2*con43*(up1-2.0*uijk+um1)-
-					tx2*(u[k][j][i+1][1]*up1-u[k][j][i-1][1]*um1+
-							(u[k][j][i+1][4]-square[k][j][i+1]-
-							 u[k][j][i-1][4]+square[k][j][i-1])*c2);
-				rhs[k][j][i][2]=rhs[k][j][i][2]+dx3tx1* 
-					(u[k][j][i+1][2]-2.0*u[k][j][i][2]+u[k][j][i-1][2])+
-					xxcon2*(vs[k][j][i+1]-2.0*vs[k][j][i]+vs[k][j][i-1])-
-					tx2*(u[k][j][i+1][2]*up1-u[k][j][i-1][2]*um1);
-				rhs[k][j][i][3]=rhs[k][j][i][3]+dx4tx1* 
-					(u[k][j][i+1][3]-2.0*u[k][j][i][3]+u[k][j][i-1][3])+
-					xxcon2*(ws[k][j][i+1]-2.0*ws[k][j][i]+ws[k][j][i-1])-
-					tx2*(u[k][j][i+1][3]*up1-u[k][j][i-1][3]*um1);
-				rhs[k][j][i][4]=rhs[k][j][i][4]+dx5tx1* 
-					(u[k][j][i+1][4]-2.0*u[k][j][i][4]+u[k][j][i-1][4])+
-					xxcon3*(qs[k][j][i+1]-2.0*qs[k][j][i]+qs[k][j][i-1])+
-					xxcon4*(up1*up1-2.0*uijk*uijk+um1*um1)+
-					xxcon5*(u[k][j][i+1][4]*rho_i[k][j][i+1]- 
-							2.0*u[k][j][i][4]*rho_i[k][j][i]+
-							u[k][j][i-1][4]*rho_i[k][j][i-1])-
-					tx2*((c1*u[k][j][i+1][4]-c2*square[k][j][i+1])*up1-
-							(c1*u[k][j][i-1][4]-c2*square[k][j][i-1])*um1);
+				block_run(k, j, i,
+					begin_z, end_z,
+					begin_y, end_y,
+					begin_x, end_x,
+					[&](){
+						uijk=us[k][j][i];
+						up1=us[k][j][i+1];
+						um1=us[k][j][i-1];
+
+						rhs[k][j][i][0]=rhs[k][j][i][0]+
+							dx1tx1 * (u[k][j][i+1][0]-2.0*u[k][j][i][0]+u[k][j][i-1][0])-
+							tx2 * (u[k][j][i+1][1]-u[k][j][i-1][1]);
+
+						rhs[k][j][i][1]=rhs[k][j][i][1]+
+							dx2tx1 * (u[k][j][i+1][1]-2.0*u[k][j][i][1]+u[k][j][i-1][1])+
+							xxcon2 * con43 * (up1-2.0*uijk+um1)-
+							tx2 * ( u[k][j][i+1][1] * up1 - 
+									u[k][j][i-1][1] * um1 +
+									(u[k][j][i+1][4] - square[k][j][i+1]- u[k][j][i-1][4] + square[k][j][i-1]) * c2);
+									
+						rhs[k][j][i][2]=rhs[k][j][i][2]+
+							dx3tx1 * (u[k][j][i+1][2] - 2.0*u[k][j][i][2] + u[k][j][i-1][2])+
+							xxcon2 * (vs[k][j][i+1] - 2.0*vs[k][j][i] + vs[k][j][i-1])-
+							tx2 * (u[k][j][i+1][2]*up1 - u[k][j][i-1][2]*um1);
+
+						rhs[k][j][i][3]=rhs[k][j][i][3]+
+							dx4tx1 * (u[k][j][i+1][3] - 2.0*u[k][j][i][3] + u[k][j][i-1][3])+
+							xxcon2 * (ws[k][j][i+1] - 2.0*ws[k][j][i] + ws[k][j][i-1])-
+							tx2 * (u[k][j][i+1][3]*up1 - u[k][j][i-1][3]*um1);
+
+						rhs[k][j][i][4]=rhs[k][j][i][4]+
+							dx5tx1 * (u[k][j][i+1][4] - 2.0*u[k][j][i][4] + u[k][j][i-1][4])+
+							xxcon3 * (qs[k][j][i+1]-2.0*qs[k][j][i]+qs[k][j][i-1])+
+							xxcon4 * (up1*up1-2.0*uijk*uijk+um1*um1)+
+							xxcon5 * ( u[k][j][i+1][4]*rho_i[k][j][i+1]- 
+										2.0*u[k][j][i][4]*rho_i[k][j][i]+
+										u[k][j][i-1][4]*rho_i[k][j][i-1])-
+							tx2 * ((c1*u[k][j][i+1][4]-c2*square[k][j][i+1]) * up1-
+									(c1*u[k][j][i-1][4]-c2*square[k][j][i-1]) * um1);
+					}
+				);
+				// uijk=us[k][j][i];
+				// up1=us[k][j][i+1];
+				// um1=us[k][j][i-1];
+				// rhs[k][j][i][0]=rhs[k][j][i][0]+
+				// 	dx1tx1 * (u[k][j][i+1][0]-2.0*u[k][j][i][0]+u[k][j][i-1][0])-
+				// 	tx2 * (u[k][j][i+1][1]-u[k][j][i-1][1]);
+				// rhs[k][j][i][1]=rhs[k][j][i][1]+
+				// 	dx2tx1 * (u[k][j][i+1][1]-2.0*u[k][j][i][1]+u[k][j][i-1][1])+
+				// 	xxcon2 * con43 * (up1-2.0*uijk+um1)-
+				// 	tx2 * ( u[k][j][i+1][1] * up1 - 
+				// 			u[k][j][i-1][1] * um1 +
+				// 			(u[k][j][i+1][4] - square[k][j][i+1]- u[k][j][i-1][4] + square[k][j][i-1]) * c2);
+				// rhs[k][j][i][2]=rhs[k][j][i][2]+
+				// 	dx3tx1 * (u[k][j][i+1][2] - 2.0*u[k][j][i][2] + u[k][j][i-1][2])+
+				// 	xxcon2 * (vs[k][j][i+1] - 2.0*vs[k][j][i] + vs[k][j][i-1])-
+				// 	tx2 * (u[k][j][i+1][2]*up1 - u[k][j][i-1][2]*um1);
+				// rhs[k][j][i][3]=rhs[k][j][i][3]+
+				// 	dx4tx1 * (u[k][j][i+1][3] - 2.0*u[k][j][i][3] + u[k][j][i-1][3])+
+				// 	xxcon2 * (ws[k][j][i+1] - 2.0*ws[k][j][i] + ws[k][j][i-1])-
+				// 	tx2 * (u[k][j][i+1][3]*up1 - u[k][j][i-1][3]*um1);
+				// rhs[k][j][i][4]=rhs[k][j][i][4]+
+				// 	dx5tx1 * (u[k][j][i+1][4] - 2.0*u[k][j][i][4] + u[k][j][i-1][4])+
+				// 	xxcon3 * (qs[k][j][i+1]-2.0*qs[k][j][i]+qs[k][j][i-1])+
+				// 	xxcon4 * (up1*up1-2.0*uijk*uijk+um1*um1)+
+				// 	xxcon5 * ( u[k][j][i+1][4]*rho_i[k][j][i+1]- 
+				// 				2.0*u[k][j][i][4]*rho_i[k][j][i]+
+				// 				u[k][j][i-1][4]*rho_i[k][j][i-1])-
+				// 	tx2 * ((c1*u[k][j][i+1][4]-c2*square[k][j][i+1]) * up1-
+				// 			(c1*u[k][j][i-1][4]-c2*square[k][j][i-1]) * um1);
 			}
 		}
 		/*
@@ -457,41 +656,77 @@ void compute_rhs(){
 		 * add fourth order xi-direction dissipation               
 		 * ---------------------------------------------------------------------
 		 */
+		/// Input: rhs[1:nz2][1:ny2][1]
 		for(j=1; j<=ny2; j++){
 			i=1;
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-					(5.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+							(5.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
+					}
+				}
+			);
 			i=2;
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-					(-4.0*u[k][j][i-1][m]+6.0*u[k][j][i][m]-
-					 4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+							(-4.0*u[k][j][i-1][m]+6.0*u[k][j][i][m]-
+							4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
+					}
+				}
+			);
 		}
 		for(j=1; j<=ny2; j++){
 			for(i=3; i<=nx2-2; i++){
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-						(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
-						 6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+ 
-						 u[k][j][i+2][m]);
-				}
+				block_run(k, j, i,
+					begin_z, end_z,
+					begin_y, end_y,
+					begin_x, end_x,
+					[&](){
+						for(m=0; m<5; m++){
+							rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+								(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
+								6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+ 
+								u[k][j][i+2][m]);
+						}
+					}
+				);
 			}
 		}
 		for(j=1; j<=ny2; j++){
 			i=nx2-1;
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
-					(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
-					 6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
+							(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
+							6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]);
+					}
+				}
+			);
 			i=nx2;
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
-					(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+5.0*u[k][j][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
+							(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+5.0*u[k][j][i][m]);
+					}
+				}
+			);
 		}
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSX);}
@@ -501,39 +736,51 @@ void compute_rhs(){
 	 * ---------------------------------------------------------------------
 	 */
 	if(timeron && thread_id==0){timer_start(T_RHSY);}
-	#pragma omp for
+	#pragma omp parallel for
 	for(k=1; k<=nz2; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
-				vijk=vs[k][j][i];
-				vp1=vs[k][j+1][i];
-				vm1=vs[k][j-1][i];
-				rhs[k][j][i][0]=rhs[k][j][i][0]+dy1ty1* 
-					(u[k][j+1][i][0]-2.0*u[k][j][i][0]+u[k][j-1][i][0])-
-					ty2*(u[k][j+1][i][2]-u[k][j-1][i][2]);
-				rhs[k][j][i][1]=rhs[k][j][i][1]+dy2ty1* 
-					(u[k][j+1][i][1]-2.0*u[k][j][i][1]+u[k][j-1][i][1])+
-					yycon2*(us[k][j+1][i]-2.0*us[k][j][i]+us[k][j-1][i])-
-					ty2*(u[k][j+1][i][1]*vp1-u[k][j-1][i][1]*vm1);
-				rhs[k][j][i][2]=rhs[k][j][i][2]+dy3ty1* 
-					(u[k][j+1][i][2]-2.0*u[k][j][i][2]+u[k][j-1][i][2])+
-					yycon2*con43*(vp1-2.0*vijk+vm1)-
-					ty2*(u[k][j+1][i][2]*vp1-u[k][j-1][i][2]*vm1+
-							(u[k][j+1][i][4]-square[k][j+1][i]- 
-							 u[k][j-1][i][4]+square[k][j-1][i])* c2);
-				rhs[k][j][i][3]=rhs[k][j][i][3]+dy4ty1* 
-					(u[k][j+1][i][3]-2.0*u[k][j][i][3]+u[k][j-1][i][3])+
-					yycon2*(ws[k][j+1][i]-2.0*ws[k][j][i]+ws[k][j-1][i])-
-					ty2*(u[k][j+1][i][3]*vp1-u[k][j-1][i][3]*vm1);
-				rhs[k][j][i][4]=rhs[k][j][i][4]+dy5ty1* 
-					(u[k][j+1][i][4]-2.0*u[k][j][i][4]+u[k][j-1][i][4])+
-					yycon3*(qs[k][j+1][i]-2.0*qs[k][j][i]+qs[k][j-1][i])+
-					yycon4*(vp1*vp1- 2.0*vijk*vijk + vm1*vm1)+
-					yycon5*(u[k][j+1][i][4]*rho_i[k][j+1][i]- 
-							2.0*u[k][j][i][4]*rho_i[k][j][i]+
-							u[k][j-1][i][4]*rho_i[k][j-1][i])-
-					ty2*((c1*u[k][j+1][i][4]-c2*square[k][j+1][i])*vp1 -
-							(c1*u[k][j-1][i][4]-c2*square[k][j-1][i])*vm1);
+				block_run(k, j, i,
+					begin_z, end_z,
+					begin_y, end_y,
+					begin_x, end_x,
+					[&](){
+						vijk=vs[k][j][i];
+						vp1=vs[k][j+1][i];
+						vm1=vs[k][j-1][i];
+
+						rhs[k][j][i][0]=rhs[k][j][i][0]+dy1ty1* 
+							(u[k][j+1][i][0]-2.0*u[k][j][i][0]+u[k][j-1][i][0])-
+							ty2*(u[k][j+1][i][2]-u[k][j-1][i][2]);
+
+						rhs[k][j][i][1]=rhs[k][j][i][1]+dy2ty1* 
+							(u[k][j+1][i][1]-2.0*u[k][j][i][1]+u[k][j-1][i][1])+
+							yycon2*(us[k][j+1][i]-2.0*us[k][j][i]+us[k][j-1][i])-
+							ty2*(u[k][j+1][i][1]*vp1-u[k][j-1][i][1]*vm1);
+							
+						rhs[k][j][i][2]=rhs[k][j][i][2]+dy3ty1* 
+							(u[k][j+1][i][2]-2.0*u[k][j][i][2]+u[k][j-1][i][2])+
+							yycon2*con43*(vp1-2.0*vijk+vm1)-
+							ty2*(u[k][j+1][i][2]*vp1-u[k][j-1][i][2]*vm1+
+									(u[k][j+1][i][4]-square[k][j+1][i]- 
+									u[k][j-1][i][4]+square[k][j-1][i])* c2);
+
+						rhs[k][j][i][3]=rhs[k][j][i][3]+dy4ty1* 
+							(u[k][j+1][i][3]-2.0*u[k][j][i][3]+u[k][j-1][i][3])+
+							yycon2*(ws[k][j+1][i]-2.0*ws[k][j][i]+ws[k][j-1][i])-
+							ty2*(u[k][j+1][i][3]*vp1-u[k][j-1][i][3]*vm1);
+
+						rhs[k][j][i][4]=rhs[k][j][i][4]+dy5ty1* 
+							(u[k][j+1][i][4]-2.0*u[k][j][i][4]+u[k][j-1][i][4])+
+							yycon3*(qs[k][j+1][i]-2.0*qs[k][j][i]+qs[k][j-1][i])+
+							yycon4*(vp1*vp1- 2.0*vijk*vijk + vm1*vm1)+
+							yycon5*(u[k][j+1][i][4]*rho_i[k][j+1][i]- 
+									2.0*u[k][j][i][4]*rho_i[k][j][i]+
+									u[k][j-1][i][4]*rho_i[k][j-1][i])-
+							ty2*((c1*u[k][j+1][i][4]-c2*square[k][j+1][i])*vp1 -
+									(c1*u[k][j-1][i][4]-c2*square[k][j-1][i])*vm1);
+					}
+				);
 			}
 		}
 		/*
@@ -543,43 +790,78 @@ void compute_rhs(){
 		 */
 		j = 1;
 		for(i=1; i<=nx2; i++){
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-					(5.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+							(5.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
+					}
+				}
+			);
 		}
 		j = 2;
 		for(i=1; i<=nx2; i++){
-			for(m = 0; m < 5; m++) {
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-					(-4.0*u[k][j-1][i][m]+6.0*u[k][j][i][m]-
-					 4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m = 0; m < 5; m++) {
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+							(-4.0*u[k][j-1][i][m]+6.0*u[k][j][i][m]-
+							4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
+					}
+				}
+			);
 		}
 		for (j=3; j<=ny2-2; j++){
 			for(i=1; i<=nx2; i++){
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
-						 6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+ 
-						 u[k][j+2][i][m]);
-				}
+				block_run(k, j, i,
+					begin_z, end_z,
+					begin_y, end_y,
+					begin_x, end_x,
+					[&](){
+						for(m=0; m<5; m++){
+							rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+								(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
+								6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+ 
+								u[k][j+2][i][m]);
+						}
+					}
+				);
 			}
 		}
 		j=ny2-1;
 		for(i=1; i<=nx2; i++){
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-					(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
-					 6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+							(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
+							6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]);
+					}
+				}
+			);
 		}
 		j=ny2;
 		for(i=1; i<=nx2; i++){
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-					(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+5.0*u[k][j][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+							(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+5.0*u[k][j][i][m]);
+					}
+				}
+			);
 		}
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSY);}
@@ -589,39 +871,49 @@ void compute_rhs(){
 	 * ---------------------------------------------------------------------
 	 */
 	if(timeron && thread_id==0){timer_start(T_RHSZ);}
-	#pragma omp for
+	#pragma omp parallel for
 	for(k=1; k<=nz2; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
-				wijk=ws[k][j][i];
-				wp1=ws[k+1][j][i];
-				wm1=ws[k-1][j][i];
-				rhs[k][j][i][0]=rhs[k][j][i][0]+dz1tz1* 
-					(u[k+1][j][i][0]-2.0*u[k][j][i][0]+u[k-1][j][i][0])-
-					tz2*(u[k+1][j][i][3]-u[k-1][j][i][3]);
-				rhs[k][j][i][1]=rhs[k][j][i][1]+dz2tz1* 
-					(u[k+1][j][i][1]-2.0*u[k][j][i][1]+u[k-1][j][i][1])+
-					zzcon2*(us[k+1][j][i]-2.0*us[k][j][i]+us[k-1][j][i])-
-					tz2*(u[k+1][j][i][1]*wp1-u[k-1][j][i][1]*wm1);
-				rhs[k][j][i][2]=rhs[k][j][i][2]+dz3tz1* 
-					(u[k+1][j][i][2]-2.0*u[k][j][i][2]+u[k-1][j][i][2])+
-					zzcon2*(vs[k+1][j][i]-2.0*vs[k][j][i]+vs[k-1][j][i])-
-					tz2*(u[k+1][j][i][2]*wp1-u[k-1][j][i][2]*wm1);
-				rhs[k][j][i][3]=rhs[k][j][i][3]+dz4tz1* 
-					(u[k+1][j][i][3]-2.0*u[k][j][i][3]+u[k-1][j][i][3])+
-					zzcon2*con43*(wp1-2.0*wijk+wm1)-
-					tz2*(u[k+1][j][i][3]*wp1-u[k-1][j][i][3]*wm1+
-							(u[k+1][j][i][4]-square[k+1][j][i]- 
-							 u[k-1][j][i][4]+square[k-1][j][i])*c2);
-				rhs[k][j][i][4]=rhs[k][j][i][4]+dz5tz1* 
-					(u[k+1][j][i][4]-2.0*u[k][j][i][4]+u[k-1][j][i][4])+
-					zzcon3*(qs[k+1][j][i]-2.0*qs[k][j][i]+qs[k-1][j][i])+
-					zzcon4*(wp1*wp1-2.0*wijk*wijk+wm1*wm1)+
-					zzcon5*(u[k+1][j][i][4]*rho_i[k+1][j][i]- 
-							2.0*u[k][j][i][4]*rho_i[k][j][i]+
-							u[k-1][j][i][4]*rho_i[k-1][j][i])-
-					tz2*((c1*u[k+1][j][i][4]-c2*square[k+1][j][i])*wp1-
-							(c1*u[k-1][j][i][4]-c2*square[k-1][j][i])*wm1);
+				block_run(k, j, i,
+					begin_z, end_z,
+					begin_y, end_y,
+					begin_x, end_x,
+					[&](){
+						wijk=ws[k][j][i];
+						wp1=ws[k+1][j][i];
+						wm1=ws[k-1][j][i];
+						rhs[k][j][i][0]=rhs[k][j][i][0]+dz1tz1* 
+							(u[k+1][j][i][0]-2.0*u[k][j][i][0]+u[k-1][j][i][0])-
+							tz2*(u[k+1][j][i][3]-u[k-1][j][i][3]);
+						rhs[k][j][i][1]=rhs[k][j][i][1]+dz2tz1* 
+							(u[k+1][j][i][1]-2.0*u[k][j][i][1]+u[k-1][j][i][1])+
+							zzcon2*(us[k+1][j][i]-2.0*us[k][j][i]+us[k-1][j][i])-
+							tz2*(u[k+1][j][i][1]*wp1-u[k-1][j][i][1]*wm1);
+
+						rhs[k][j][i][2]=rhs[k][j][i][2]+dz3tz1* 
+							(u[k+1][j][i][2]-2.0*u[k][j][i][2]+u[k-1][j][i][2])+
+							zzcon2*(vs[k+1][j][i]-2.0*vs[k][j][i]+vs[k-1][j][i])-
+							tz2*(u[k+1][j][i][2]*wp1-u[k-1][j][i][2]*wm1);
+
+						rhs[k][j][i][3]=rhs[k][j][i][3]+dz4tz1* 
+							(u[k+1][j][i][3]-2.0*u[k][j][i][3]+u[k-1][j][i][3])+
+							zzcon2*con43*(wp1-2.0*wijk+wm1)-
+							tz2*(u[k+1][j][i][3]*wp1-u[k-1][j][i][3]*wm1+
+									(u[k+1][j][i][4]-square[k+1][j][i]- 
+									u[k-1][j][i][4]+square[k-1][j][i])*c2);
+
+						rhs[k][j][i][4]=rhs[k][j][i][4]+dz5tz1* 
+							(u[k+1][j][i][4]-2.0*u[k][j][i][4]+u[k-1][j][i][4])+
+							zzcon3*(qs[k+1][j][i]-2.0*qs[k][j][i]+qs[k-1][j][i])+
+							zzcon4*(wp1*wp1-2.0*wijk*wijk+wm1*wm1)+
+							zzcon5*(u[k+1][j][i][4]*rho_i[k+1][j][i]- 
+									2.0*u[k][j][i][4]*rho_i[k][j][i]+
+									u[k-1][j][i][4]*rho_i[k-1][j][i])-
+							tz2*((c1*u[k+1][j][i][4]-c2*square[k+1][j][i])*wp1-
+									(c1*u[k-1][j][i][4]-c2*square[k-1][j][i])*wm1);
+					}
+				);
 			}
 		}
 	}
@@ -631,68 +923,110 @@ void compute_rhs(){
 	 * ---------------------------------------------------------------------
 	 */
 	k=1;
-	#pragma omp for
+	#pragma omp parallel for
 	for(j=1; j<=ny2; j++){
 		for(i=1; i<=nx2; i++){
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-					(5.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+							(5.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
+					}
+				}
+			);
 		}
 	}
 	k=2;
-	#pragma omp for
+	#pragma omp parallel for
 	for(j=1; j<=ny2; j++){
 		for(i=1; i<=nx2; i++){
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-					(-4.0*u[k-1][j][i][m]+6.0*u[k][j][i][m]-
-					 4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+							(-4.0*u[k-1][j][i][m]+6.0*u[k][j][i][m]-
+							4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
+					}
+				}
+			);
 		}
 	}
-	#pragma omp for
+	#pragma omp parallel for
 	for(k=3; k<=nz2-2; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-						(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
-						 6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+ 
-						 u[k+2][j][i][m]);
-				}
+				block_run(k, j, i,
+					begin_z, end_z,
+					begin_y, end_y,
+					begin_x, end_x,
+					[&](){
+						for(m=0; m<5; m++){
+							rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+								(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
+								6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+ 
+								u[k+2][j][i][m]);
+						}	
+					}
+				);
 			}
 		}
 	}
 	k=nz2-1;
-	#pragma omp for
+	#pragma omp parallel for
 	for(j=1; j<=ny2; j++){
 		for(i=1; i<=nx2; i++){
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
-					 6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+							(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
+							6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]);
+					}
+				}
+			);
 		}
 	}
 	k=nz2;
-	#pragma omp for
+	#pragma omp parallel for
 	for(j=1; j<=ny2; j++){
 		for(i=1; i<=nx2; i++){
-			for(m=0; m<5; m++){
-				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+5.0*u[k][j][i][m]);
-			}
+			block_run(k, j, i,
+				begin_z, end_z,
+				begin_y, end_y,
+				begin_x, end_x,
+				[&](){
+					for(m=0; m<5; m++){
+						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+							(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+5.0*u[k][j][i][m]);
+					}
+				}
+			);
 		}
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSZ);}
-	#pragma omp for
+	#pragma omp parallel for
 	for(k=1; k<=nz2; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=rhs[k][j][i][m]*dt;
-				}
+				block_run(k, j, i,
+					begin_z, end_z,
+					begin_y, end_y,
+					begin_x, end_x,
+					[&](){
+						for(m=0; m<5; m++){
+							rhs[k][j][i][m]=rhs[k][j][i][m]*dt;
+						}
+					}
+				);
 			}
 		}
 	}
@@ -1269,22 +1603,31 @@ void lhsinitj(int nj, int ni){
  * ---------------------------------------------------------------------
  */
 void ninvr(){
+	// used only by {x_solve}
 	int i, j, k;
 	double r1, r2, r3, r4, r5, t1, t2;
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_NINVR);}
-	#pragma omp for
-	for(k=1; k<=nz2; k++){
+
+
+	int scale = nz2, partition_size = 0, begin = 0, end = 0;
+	partition(partition_size, begin, end, scale);
+
+	#pragma omp parallel for
+	for(k=begin; k<=end; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
+				// local r1 to r5
 				r1=rhs[k][j][i][0];
 				r2=rhs[k][j][i][1];
 				r3=rhs[k][j][i][2];
 				r4=rhs[k][j][i][3];
 				r5=rhs[k][j][i][4];
+				// local t1, t2
 				t1=bt*r3;
 				t2=0.5*(r4+r5);
+				// reassign rhs
 				rhs[k][j][i][0]=-r2;
 				rhs[k][j][i][1]=r1;
 				rhs[k][j][i][2]=bt*(r4-r5);
@@ -1293,6 +1636,8 @@ void ninvr(){
 			}
 		}
 	}
+	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+
 	if(timeron && thread_id==0){timer_stop(T_NINVR);}
 }
 
@@ -1307,8 +1652,15 @@ void pinvr(){
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_PINVR);}
-	#pragma omp for
-	for(k=1; k<=nz2; k++){
+
+	int scale = nz2, partition_size = 0, begin = 0, end = 0;
+	partition(partition_size, begin, end, scale);
+
+	/// Input:	rhs[1:nz2][1:ny2][1:nx2]
+	///			bt
+	/// Output:	rhs[1:nz2][1:ny2][1:nx2]
+	#pragma omp parallel for
+	for(k=begin; k<=end; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
 				r1=rhs[k][j][i][0];
@@ -1326,6 +1678,8 @@ void pinvr(){
 			}
 		}
 	}
+	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+
 	if(timeron && thread_id==0){timer_stop(T_PINVR);}
 }
 
@@ -1554,9 +1908,14 @@ void txinvr(){
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_TXINVR);}
-	#pragma omp for
-	for(k=1; k<=nz2; k++){
-		for(j=1; j<=ny2; j++){
+
+	int scale = nz2, begin = 0, end = 0, partition_size = 0;
+	partition(partition_size, begin, end, scale);
+
+	#pragma omp parallel for
+	for(k=begin; k<=end; k++){
+        // plane
+        for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
 				ru1=rho_i[k][j][i];
 				uu=us[k][j][i];
@@ -1572,6 +1931,8 @@ void txinvr(){
 				t1=c2/ac2inv*(qs[k][j][i]*r1-uu*r2-vv*r3-ww*r4+r5);
 				t2=bt*ru1*(uu*r1-r2);
 				t3=(bt*ru1*ac)*t1;
+
+				/// assign
 				rhs[k][j][i][0]=r1-t1;
 				rhs[k][j][i][1]=-ru1*(ww*r1-r4);
 				rhs[k][j][i][2]=ru1*(vv*r1-r3);
@@ -1580,6 +1941,8 @@ void txinvr(){
 			}
 		}
 	}
+	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+
 	if(timeron && thread_id==0){timer_stop(T_TXINVR);}
 }
 
@@ -1594,7 +1957,20 @@ void tzetar(){
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_TZETAR);}
-	#pragma omp for
+
+	int scale = nz2, partition_size = 0, begin = 0, end = 0;
+	partition(partition_size, begin, end, scale);
+
+	#pragma omp parallel for
+	/// Input:	us[1:nz2][1:ny2][1:nx2]
+	/// 		vs[1:nz2][1:ny2][1:nx2]
+	/// 		ws[1:nz2][1:ny2][1:nx2]
+	/// 		speed[1:nz2][1:ny2][1:nx2]
+	/// 		rhs[1:nz2][1:ny2][1:nx2][0:4]
+	/// 		u[1:nz2][1:ny2][1:nx2][0]
+	/// 		qs[1:nz2][1:ny2][1:nx2]
+	/// 		bt, c2iv
+	///	Output:	rhs[1:nz2][1:ny2][1:nx2][0:4]
 	for(k=1; k<=nz2; k++){
 		for(j=1; j<=ny2; j++){
 			for(i=1; i<=nx2; i++){
@@ -1613,6 +1989,7 @@ void tzetar(){
 				t1=btuz/ac*(r4+r5);
 				t2=r3+t1;
 				t3=btuz*(r4-r5);
+				/// assign
 				rhs[k][j][i][0]=t2;
 				rhs[k][j][i][1]=-uzik1*r2+xvel*t2;
 				rhs[k][j][i][2]=uzik1*r1+yvel*t2;
@@ -1622,6 +1999,8 @@ void tzetar(){
 			}
 		}
 	}
+	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+
 	if(timeron && thread_id==0){timer_stop(T_TZETAR);}
 }
 
@@ -1937,13 +2316,17 @@ void x_solve(){
 
 	if(timeron && thread_id==0){timer_start(T_XSOLVE);}
 
-	#pragma omp for
-	for(k=1; k<=nz2; k++){
+	int scale = nz2, partition_size = 0, begin = 0, end = scale;
+	partition(partition_size, begin, end, scale);
+
+	#pragma omp parallel for
+	for(k=begin; k<=end; k++){
 		double cv[PROBLEM_SIZE], rhon[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
 		double lhsm[IMAXP+1][IMAXP+1][5];
 
+		/// init lhs, lhsp, lhsm
 		for(j=1; j<=ny2; j++){
 			for(m=0; m<5; m++){
 				lhs[j][0][m]=0.0;
@@ -2203,6 +2586,9 @@ void x_solve(){
 			}
 		}
 	}
+	
+	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+
 	if(timeron && thread_id==0){timer_stop(T_XSOLVE);}
 	/*
 	 * ---------------------------------------------------------------------
@@ -2226,8 +2612,13 @@ void y_solve(){
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_YSOLVE);}
-	#pragma omp for
-	for(k=1; k<=grid_points[2]-2; k++){
+
+	int partition_size = 0, begin = 0, end = 0, scale = grid_points[2] - 2;
+	partition(partition_size, begin, end, scale);
+	
+	#pragma omp parallel for
+	// for(k=1; k<=grid_points[2]-2; k++){
+	for(k=begin; k<=end; k++){
 		double cv[PROBLEM_SIZE], rhoq[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
@@ -2489,6 +2880,9 @@ void y_solve(){
 			}
 		}
 	}
+	
+	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+
 	if(timeron && thread_id==0){timer_stop(T_YSOLVE);}
 	pinvr();
 }
@@ -2507,13 +2901,18 @@ void z_solve(){
 	int thread_id = omp_get_thread_num();
 	
 	if(timeron && thread_id==0){timer_start(T_ZSOLVE);}
-	#pragma omp for
+	
+	// int scale = KMAX, begin = 0, end = 0, partition_size = 0;
+	// partition(partition_size, begin, end, scale);
+
+	#pragma omp parallel for
 	for(j=1; j<=ny2; j++){
 		double cv[PROBLEM_SIZE], rhos[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
 		double lhsm[IMAXP+1][IMAXP+1][5];
 
+		/// init {lhs, lhsp, lhsm} 
 		for(i=1; i<=nx2; i++){
 			for(m=0; m<5; m++){
 				lhs[0][i][m]=0.0;
@@ -2538,12 +2937,18 @@ void z_solve(){
 		 * first fill the lhs for the u-eigenvalue                          
 		 * ---------------------------------------------------------------------
 		 */
+		/// Input:	c3c4, dz4, con43, dz5, c1c5, dzmax, dz1
+		///			rho_i[0:nz2+1][1:ny2][1:nx2]
+		///			ws[0:nz2+1][1:ny2][1:nx2]
 		for(i=1; i<=nx2; i++){
+			/// init local variables
 			for(k=0; k<=nz2+1; k++){
 				ru1=c3c4*rho_i[k][j][i];
 				cv[k]=ws[k][j][i];
 				rhos[k]=max(max(dz4+con43*ru1, dz5+c1c5*ru1), max(dzmax+ru1, dz1));
 			}
+			/// Input:	dttz2, dttz1, c2dttz1
+			/// Output:	lhs[0:nz2+1][1:nx2][0:4]	
 			for(k=1; k<=nz2; k++){
 				lhs[k][i][0]=0.0;
 				lhs[k][i][1]=-dttz2*cv[k-1]-dttz1*rhos[k-1];
@@ -2557,6 +2962,9 @@ void z_solve(){
 		 * add fourth order dissipation                                  
 		 * ---------------------------------------------------------------------
 		 */
+		/// Input:	lhs[1:2][1:nx2][1:4]
+		///			comz1, comz4, comz5, comz6
+		/// Output:	lhs[1:2][1:nx2][1:4]
 		for(i=1; i<=nx2; i++){
 			k=1;
 			lhs[k][i][2]=lhs[k][i][2]+comz5;
@@ -2568,6 +2976,9 @@ void z_solve(){
 			lhs[k][i][3]=lhs[k][i][3]-comz4;
 			lhs[k][i][4]=lhs[k][i][4]+comz1;
 		}
+		/// Input:	lhs[3:nz2-2][1:nx2][0:4]
+		///			comz1, comz4, comz6
+		/// Output:	lhs[3:nz2-2][1:nx2][0:4]
 		for(k=3; k<=nz2-2; k++){
 			for(i=1; i<=nx2; i++){
 				lhs[k][i][0]=lhs[k][i][0]+comz1;
@@ -2577,6 +2988,9 @@ void z_solve(){
 				lhs[k][i][4]=lhs[k][i][4]+comz1;
 			}
 		}
+		/// Input:	lhs[nz2-1:nz2][1:nx2][0:3]
+		///			comz1, comz4, comz5, comz6
+		/// Output:	lhs[nz2-1:nz2][1:nx2][0:3]
 		for(i=1; i<=nx2; i++){
 			k=nz2-1;
 			lhs[k][i][0]=lhs[k][i][0]+comz1;
@@ -2588,11 +3002,14 @@ void z_solve(){
 			lhs[k][i][1]=lhs[k][i][1]-comz4;
 			lhs[k][i][2]=lhs[k][i][2]+comz5;
 		}
+
 		/*
 		 * ---------------------------------------------------------------------
 		 * subsequently, fill the other factors (u+c), (u-c) 
 		 * ---------------------------------------------------------------------
 		 */
+		/// Output: lhsp[1:nz2][1:nx2][0:4] (local)
+		/// 		lhsm[1:nz2][1:nx2][0:4] (local)
 		for(k=1; k<=nz2; k++){
 			for(i=1; i<=nx2; i++){
 				lhsp[k][i][0]=lhs[k][i][0];
@@ -2600,6 +3017,7 @@ void z_solve(){
 				lhsp[k][i][2]=lhs[k][i][2];
 				lhsp[k][i][3]=lhs[k][i][3]+dttz2*speed[k+1][j][i];
 				lhsp[k][i][4]=lhs[k][i][4];
+
 				lhsm[k][i][0]=lhs[k][i][0];
 				lhsm[k][i][1]=lhs[k][i][1]+dttz2*speed[k-1][j][i];
 				lhsm[k][i][2]=lhs[k][i][2];
@@ -2607,26 +3025,32 @@ void z_solve(){
 				lhsm[k][i][4]=lhs[k][i][4];
 			}
 		}
+
 		/*
 		 * ---------------------------------------------------------------------
 		 * FORWARD ELIMINATION  
 		 * ---------------------------------------------------------------------
 		 */
+		/// Output:	lhs[0:grid_points[2]][1:nx2][1:4] (local)
+		/// 		rhs[0:grid_points[2]][1:ny2][1:nx2][0:3] (local)
 		for(k=0; k<=grid_points[2]-3; k++){
 			k1=k+1;
 			k2=k+2;
 			for(i=1; i<=nx2; i++){
 				fac1=1.0/lhs[k][i][2];
+
 				lhs[k][i][3]=fac1*lhs[k][i][3];
 				lhs[k][i][4]=fac1*lhs[k][i][4];
 				for(m=0; m<3; m++){
 					rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
 				}
+
 				lhs[k1][i][2]=lhs[k1][i][2]-lhs[k1][i][1]*lhs[k][i][3];
 				lhs[k1][i][3]=lhs[k1][i][3]-lhs[k1][i][1]*lhs[k][i][4];
 				for(m=0; m<3; m++){
 					rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhs[k1][i][1]*rhs[k][j][i][m];
 				}
+
 				lhs[k2][i][1]=lhs[k2][i][1]-lhs[k2][i][0]*lhs[k][i][3];
 				lhs[k2][i][2]=lhs[k2][i][2]-lhs[k2][i][0]*lhs[k][i][4];
 				for(m=0; m<3; m++){
@@ -2634,6 +3058,7 @@ void z_solve(){
 				}
 			}
 		}
+
 		/*
 		 * ---------------------------------------------------------------------
 		 * the last two rows in this grid block are a bit different, 
@@ -2641,20 +3066,24 @@ void z_solve(){
 		 * elimination of off-diagonal entries
 		 * ---------------------------------------------------------------------
 		 */
+		/// Output:	rhs[]
 		k=grid_points[2]-2;
 		k1=grid_points[2]-1;
 		for(i=1; i<=nx2; i++){
 			fac1=1.0/lhs[k][i][2];
+
 			lhs[k][i][3]=fac1*lhs[k][i][3];
 			lhs[k][i][4]=fac1*lhs[k][i][4];
 			for(m=0; m<3; m++){
 				rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
 			}
+
 			lhs[k1][i][2]=lhs[k1][i][2]-lhs[k1][i][1]*lhs[k][i][3];
 			lhs[k1][i][3]=lhs[k1][i][3]-lhs[k1][i][1]*lhs[k][i][4];
 			for(m=0; m<3; m++){
 				rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhs[k1][i][1]*rhs[k][j][i][m];
 			}
+
 			/*
 			 * ---------------------------------------------------------------------
 			 * scale the last row immediately
@@ -2679,20 +3108,25 @@ void z_solve(){
 				lhsp[k][i][3]=fac1*lhsp[k][i][3];
 				lhsp[k][i][4]=fac1*lhsp[k][i][4];
 				rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
+
 				lhsp[k1][i][2]=lhsp[k1][i][2]-lhsp[k1][i][1]*lhsp[k][i][3];
 				lhsp[k1][i][3]=lhsp[k1][i][3]-lhsp[k1][i][1]*lhsp[k][i][4];
 				rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsp[k1][i][1]*rhs[k][j][i][m];
+
 				lhsp[k2][i][1]=lhsp[k2][i][1]-lhsp[k2][i][0]*lhsp[k][i][3];
 				lhsp[k2][i][2]=lhsp[k2][i][2]-lhsp[k2][i][0]*lhsp[k][i][4];
 				rhs[k2][j][i][m]=rhs[k2][j][i][m]-lhsp[k2][i][0]*rhs[k][j][i][m];
+
 				m=4;
 				fac1=1.0/lhsm[k][i][2];
 				lhsm[k][i][3]=fac1*lhsm[k][i][3];
 				lhsm[k][i][4]=fac1*lhsm[k][i][4];
 				rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
+				
 				lhsm[k1][i][2]=lhsm[k1][i][2]-lhsm[k1][i][1]*lhsm[k][i][3];
 				lhsm[k1][i][3]=lhsm[k1][i][3]-lhsm[k1][i][1]*lhsm[k][i][4];
 				rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsm[k1][i][1]*rhs[k][j][i][m];
+
 				lhsm[k2][i][1]=lhsm[k2][i][1]-lhsm[k2][i][0]*lhsm[k][i][3];
 				lhsm[k2][i][2]=lhsm[k2][i][2]-lhsm[k2][i][0]*lhsm[k][i][4];
 				rhs[k2][j][i][m]=rhs[k2][j][i][m]-lhsm[k2][i][0]*rhs[k][j][i][m];
@@ -2711,17 +3145,21 @@ void z_solve(){
 			lhsp[k][i][3]=fac1*lhsp[k][i][3];
 			lhsp[k][i][4]=fac1*lhsp[k][i][4];
 			rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
+
 			lhsp[k1][i][2]=lhsp[k1][i][2]-lhsp[k1][i][1]*lhsp[k][i][3];
 			lhsp[k1][i][3]=lhsp[k1][i][3]-lhsp[k1][i][1]*lhsp[k][i][4];
 			rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsp[k1][i][1]*rhs[k][j][i][m];
+			
 			m=4;
 			fac1=1.0/lhsm[k][i][2];
 			lhsm[k][i][3]=fac1*lhsm[k][i][3];
 			lhsm[k][i][4]=fac1*lhsm[k][i][4];
 			rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
+
 			lhsm[k1][i][2]=lhsm[k1][i][2]-lhsm[k1][i][1]*lhsm[k][i][3];
 			lhsm[k1][i][3]=lhsm[k1][i][3]-lhsm[k1][i][1]*lhsm[k][i][4];
 			rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsm[k1][i][1]*rhs[k][j][i][m];
+
 			/*
 			 * ---------------------------------------------------------------------
 			 * scale the last row immediately (some of this is overkill
@@ -2745,6 +3183,7 @@ void z_solve(){
 			rhs[k][j][i][3]=rhs[k][j][i][3]-lhsp[k][i][3]*rhs[k1][j][i][3];
 			rhs[k][j][i][4]=rhs[k][j][i][4]-lhsm[k][i][3]*rhs[k1][j][i][4];
 		}
+
 		/*
 		 * ---------------------------------------------------------------------
 		 * whether or not this is the last processor, we always have
@@ -2775,7 +3214,10 @@ void z_solve(){
 					lhsm[k][i][4]*rhs[k2][j][i][4];
 			}
 		}
-	}
+	} // end of parallel for
+
+	// sync_buffer(rhs, begin, end, partition_size, 0, scale);
+
 	if(timeron && thread_id==0){timer_stop(T_ZSOLVE);}
 	tzetar();
 }
