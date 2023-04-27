@@ -84,7 +84,13 @@ Authors of the OpenMP code:
 #define T_ADD 15
 #define T_LAST 15
 
-#define DEBUG true
+#ifndef DEBUG
+#define DEBUG false
+// #define DEBUG true
+#endif
+const bool compute_rhs_no_sync = true;
+// const bool compute_rhs_no_sync = false;
+
 template <typename... Args>
 inline void debug_printf(Args&&... args) {
 	if (DEBUG) {
@@ -92,7 +98,7 @@ inline void debug_printf(Args&&... args) {
 	}
 }
 
-/* global variables */
+
 #if defined(DO_NOT_ALLOCATE_ARRAYS_WITH_DYNAMIC_MEMORY_AND_AS_SINGLE_DIMENSION)
 static double u[KMAX][JMAXP+1][IMAXP+1][5];
 static double us[KMAX][JMAXP+1][IMAXP+1];
@@ -228,7 +234,8 @@ static inline bool in_block(const int idx, const int begin, const int end) {
 }
 
 template <typename Fn_, typename... Args>
-static inline void block_z_run(const int k, const BlockRange& range,
+static inline void block_z_run(const int k, 
+							const BlockRange& range,
 							Fn_&& fn, Args&&... args) {
 	if (in_block(k, range.bz, range.ez)) {
 		fn(args...);
@@ -256,7 +263,9 @@ static inline void block_zyx_run(const int k, const int j, const int i,
 }
 
 template <typename Fn_, typename... Args>
-static inline void block_for(int& k, int& j, int& i, const BlockRange& range, Fn_&& fn, Args&&... args) {
+static inline void block_for(int& k, int& j, int& i, 
+							const BlockRange& range, 
+							Fn_&& fn, Args&&... args) {
 	for(k = range.bz; k <= range.ez; k++) {
 		for(j = range.by; j <= range.ey; j++) {
 			for(i = range.bx; i <= range.ex; i++) {
@@ -273,12 +282,23 @@ using MpiToolKit::partition;
 using MpiToolKit::sync_buffer;
 using MpiToolKit::in_block;
 
-#define BLOCK_ZY_RUN_IF(k, j, bz, ez, by, ey) \
-	if (in_block((k), (bz), (ez)) && \
-		in_block((j), (by), (ey)))
+inline void debug_print_rhs(int line = 0) {
+	if (getCommunicator().world_rank == 1) {return;}
+	#pragma omp critical
+	{
+		debug_printf("[%d] T%d l(%d) | rhs: ", getCommunicator().world_rank, omp_get_thread_num(), line);
 
-#define BLOCK_Z_RUN_IF(k, bz, ez) \
-	if (in_block((k), (bz), (ez)))
+		debug_printf("(%lf)(%lf)(%lf)(%lf)(%lf)", rhs[0][0][0][2], rhs[11][0][0][2], rhs[1][1][1][0], rhs[6][1][1][0], rhs[10][1][1][0]);
+
+		debug_printf("\n", NULL);
+	}
+}
+
+inline void sync_by_z() {
+	int pz = 0, sz = nz2, bz = 0, ez = 0;
+	partition(pz, bz, ez, sz);
+	sync_buffer(rhs, bz, ez, pz, 1, sz);
+}
 
 /* function prototypes */
 void add();
@@ -382,10 +402,8 @@ int main(int argc, char* argv[]){
 	 * do one time step to touch all code, and reinitialize
 	 * ---------------------------------------------------------------------
 	 */
-	#pragma omp parallel
-	{
-		adi();
-	}
+	// #pragma omp parallel
+	// adi();
 	initialize();
 	for(i=1;i<=T_LAST;i++){timer_clear(i);}
 	timer_start(1);
@@ -393,10 +411,7 @@ int main(int argc, char* argv[]){
 		if((step%20)==0||step==1){
 				printf(" Time step %4d\n",step);
 		}
-		#pragma omp parallel
-		{
-			adi();
-		}
+		adi();
 	}
 	timer_stop(1);
 	tmax=timer_read(1);
@@ -466,6 +481,7 @@ int main(int argc, char* argv[]){
 	return 0;
 }
 
+
 /*
  * ---------------------------------------------------------------------
  * addition of update to the vector u
@@ -479,47 +495,57 @@ void add(){
 	
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
 	int partition_size_z = 0, scale_z = ny2;
-	partition(partition_size_z, range.bz, range.ez, scale_z);
+	// partition(partition_size_z, range.bz, range.ez, scale_z);
 
 	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
 		for(j=range.by; j<=range.ey; j++){
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				for(m=0; m<5; m++){
 					u[k][j][i][m]=u[k][j][i][m]+rhs[k][j][i][m];
 				}
 			}
 		}
 	}
-	sync_buffer(u, range.bz, range.ez, partition_size_z, 1, scale_z);
-
+	
+	// sync_buffer(u, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_ADD);}
 }
 
 void adi(){
-	compute_rhs();
-	txinvr();
-	x_solve();
-	y_solve();
-	z_solve();
-	add();
+	// debug_print_rhs(__LINE__);
+	#pragma omp parallel
+	{
+		compute_rhs();
+		// debug_print_rhs(__LINE__);
+		txinvr();
+		// debug_print_rhs(__LINE__);
+	}
+	sync_by_z();
+	#pragma omp parallel
+	{
+		x_solve();
+		// debug_print_rhs(__LINE__);
+		y_solve();
+		// debug_print_rhs(__LINE__);
+		z_solve();
+		// debug_print_rhs(__LINE__);
+		add();
+		// debug_print_rhs(__LINE__);
+	}
 }
 
 void compute_rhs(){
-	debug_printf("[%d] %s, %d\n", getCommunicator().world_rank, __func__, __LINE__);
 	int i, j, k, m;
 	double aux, rho_inv, uijk, up1, um1, vijk, vp1, vm1, wijk, wp1, wm1;
 	int thread_id = omp_get_thread_num();
 
-	if(timeron && thread_id==0){timer_start(T_RHS);}
-
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
 	int partition_size_z = 0, scale_z = nz2;
-	int partition_size_y = 0, scale_y = ny2;
 	partition(partition_size_z, range.bz, range.ez, scale_z);
-	// partition(partition_size_y, range.by, range.ey, scale_y);
 
+	if(timeron && thread_id==0){timer_start(T_RHS);}
 	/*
 	 * ---------------------------------------------------------------------
 	 * compute the reciprocal of density, and the kinetic energy, 
@@ -613,26 +639,28 @@ void compute_rhs(){
 		 * add fourth order xi-direction dissipation               
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=range.by; j<=range.ey; j++){
+		for(j=1; j<=ny2; j++){
 			i=1;
 			if(in_block(i, range.bx, range.ex)) {
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-						(5.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
-				}
+			for(m=0; m<5; m++){
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+					(5.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
 			}
+			}
+
 			i=2;
 			if(in_block(i, range.bx, range.ex)) {
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-						(-4.0*u[k][j][i-1][m]+6.0*u[k][j][i][m]-
-						4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
-				}
+			for(m=0; m<5; m++){
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+					(-4.0*u[k][j][i-1][m]+6.0*u[k][j][i][m]-
+					 4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
+			}
 			}
 		}
 
 		for(j=range.by; j<=range.ey; j++){
-			for(i=max(3, range.bx); i<=min(nx2-2, range.ex); i++){
+			int tmp_i_start = max(3, range.bx), tmp_i_limit = min(nx2 - 2, range.ex);
+			for(i=tmp_i_start; i<=tmp_i_limit; i++){
 				for(m=0; m<5; m++){
 					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
 						(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
@@ -645,18 +673,19 @@ void compute_rhs(){
 		for(j=range.by; j<=range.ey; j++){
 			i=nx2-1;
 			if(in_block(i, range.bx, range.ex)) {
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
-						(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
-						6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]);
-				}
+			for(m=0; m<5; m++){
+				rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
+					(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
+					 6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]);
 			}
+			}
+
 			i=nx2;
 			if(in_block(i, range.bx, range.ex)) {
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
-						(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+5.0*u[k][j][i][m]);
-				}
+			for(m=0; m<5; m++){
+				rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
+					(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+5.0*u[k][j][i][m]);
+			}
 			}
 		}
 	}
@@ -709,25 +738,27 @@ void compute_rhs(){
 		 */
 		j = 1;
 		if(in_block(j, range.by, range.ey)) {
-			for(i=range.bx; i<=range.ex; i++){
-				for(m=0; m<5; m++){
-					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-						(5.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
-				}
+		for(i=1; i<=nx2; i++){
+			for(m=0; m<5; m++){
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+					(5.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
 			}
+		}
 		}
 
 		j = 2;
 		if(in_block(j, range.by, range.ey)) {
-			for(i=range.bx; i<=range.ex; i++){
-				for(m = 0; m < 5; m++) {
-					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-						(-4.0*u[k][j-1][i][m]+6.0*u[k][j][i][m]-
-						4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
-				}
+		for(i=1; i<=nx2; i++){
+			for(m = 0; m < 5; m++) {
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+					(-4.0*u[k][j-1][i][m]+6.0*u[k][j][i][m]-
+					 4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
 			}
 		}
-		for (j=max(3, range.by); j<=min(range.ey, ny2-2); j++){
+		}
+
+		int tmp_j_start = max(3, range.by), tmp_j_limit = min(ny2 - 2, range.ey);
+		for (j=tmp_j_start; j<=tmp_j_limit; j++){
 			for(i=range.bx; i<=range.ex; i++){
 				for(m=0; m<5; m++){
 					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
@@ -740,7 +771,7 @@ void compute_rhs(){
 
 		j=ny2-1;
 		if(in_block(j, range.by, range.ey)) {
-			for(i=range.bx; i<=range.ex; i++){
+			for(i=1; i<=nx2; i++){
 				for(m=0; m<5; m++){
 					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
@@ -751,7 +782,7 @@ void compute_rhs(){
 
 		j=ny2;
 		if(in_block(j, range.by, range.ey)) {
-			for(i=range.bx; i<=range.ex; i++){
+			for(i=1; i<=nx2; i++){
 				for(m=0; m<5; m++){
 					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+5.0*u[k][j][i][m]);
@@ -807,10 +838,9 @@ void compute_rhs(){
 	 * add fourth order zeta-direction dissipation                
 	 * ---------------------------------------------------------------------
 	 */
-
 	k=1;
 	#pragma omp for
-	for(j=range.by; j<=range.ey; j++){
+	for(j=1; j<=ny2; j++){
 		MpiToolKit::block_zy_run(k, j, range, [&](){
 		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<5; m++){
@@ -820,10 +850,9 @@ void compute_rhs(){
 		}
 		});
 	}
-	
 	k=2;
 	#pragma omp for
-	for(j=range.by; j<=range.ey; j++){
+	for(j=1; j<=ny2; j++){
 		MpiToolKit::block_zy_run(k, j, range, [&](){
 		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<5; m++){
@@ -835,8 +864,9 @@ void compute_rhs(){
 		});
 	}
 
+	int tmp_k_start = max(3, range.bz), tmp_k_limit = min(range.ez, nz2 - 2);
 	#pragma omp for
-	for(k=max(3, range.bz); k<=min(range.ez, nz2-2); k++){
+	for(k=tmp_k_start; k<=tmp_k_limit; k++){
 		for(j=range.by; j<=range.ey; j++){
 			for(i=range.bx; i<=range.ex; i++){
 				for(m=0; m<5; m++){
@@ -848,38 +878,35 @@ void compute_rhs(){
 			}
 		}
 	}
-
 	k=nz2-1;
-	// MpiToolKit::block_z_run(k, range, [&]() {
 	if(in_block(k, range.bz, range.ez)) {
 	#pragma omp for
-	for(int j=range.by; j<=range.ey; j++){
-		for(int i=range.bx; i<=range.ex; i++){
-			for(int m=0; m<5; m++){
+	for(j=1; j<=ny2; j++){
+		for(i=1; i<=nx2; i++){
+			for(m=0; m<5; m++){
 				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
 					 6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]);
 			}
 		}
 	}
-	// });
 	}
 
 	k=nz2;
-	// MpiToolKit::block_z_run(k, range, [&]() {
 	if(in_block(k, range.bz, range.ez)) {
 	#pragma omp for
-	for(int j=range.by; j<=range.ey; j++){
-		for(int i=range.bx; i<=range.ex; i++){
-			for(int m=0; m<5; m++){
+	for(j=1; j<=ny2; j++){
+		for(i=1; i<=nx2; i++){
+			for(m=0; m<5; m++){
 				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+5.0*u[k][j][i][m]);
 			}
 		}
 	}
-	// });
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSZ);}
+
+	debug_print_rhs(__LINE__);
 
 	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
@@ -892,10 +919,10 @@ void compute_rhs(){
 		}
 	}
 
-	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
+	debug_print_rhs(__LINE__);
 
 	if(timeron && thread_id==0){timer_stop(T_RHS);}
-	debug_printf("[%d] %s, %d\n", getCommunicator().world_rank, __func__, __LINE__);
+
 }
 
 /*
@@ -1478,10 +1505,9 @@ void ninvr(){
 
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
 	int partition_size_z = 0, scale_z = nz2;
-	partition(partition_size_z, range.bz, range.ez, scale_z);
+	// partition(partition_size_z, range.bz, range.ez, scale_z);
 
-	// #pragma omp for
-	#pragma omp for 
+	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
 		for(j=range.by; j<=range.ey; j++){
 			for(i=range.bx; i<=range.ex; i++) {
@@ -1502,7 +1528,7 @@ void ninvr(){
 			}
 		}
 	}
-	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
+	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_NINVR);}
 }
@@ -1521,7 +1547,7 @@ void pinvr(){
 
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
 	int partition_size_z = 0, scale_z = nz2;
-	partition(partition_size_z, range.bz, range.ez, scale_z);
+	// partition(partition_size_z, range.bz, range.ez, scale_z);
 
 	/// Input:	rhs[1:nz2][1:ny2][1:nx2]
 	///			bt
@@ -1545,7 +1571,7 @@ void pinvr(){
 			}
 		}
 	}
-	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
+	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_PINVR);}
 }
@@ -1770,7 +1796,6 @@ void set_constants(){
  * ---------------------------------------------------------------------
  */
 void txinvr(){
-	debug_printf("[%d] %s, %d\n", getCommunicator().world_rank, __func__, __LINE__);
 	int i, j, k;
 	double t1, t2, t3, ac, ru1, uu, vv, ww, r1, r2, r3, r4, r5, ac2inv;
 	int thread_id = omp_get_thread_num();
@@ -1810,7 +1835,7 @@ void txinvr(){
 			}
 		}
 	}
-	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
+	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_TXINVR);}
 }
@@ -1829,7 +1854,7 @@ void tzetar(){
 
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
 	int partition_size_z = 0, scale_z = nz2;
-	partition(partition_size_z, range.bz, range.ez, scale_z);
+	// partition(partition_size_z, range.bz, range.ez, scale_z);
 
 	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
@@ -1860,7 +1885,7 @@ void tzetar(){
 			}
 		}
 	}
-	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
+	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_TZETAR);}
 }
@@ -1886,6 +1911,11 @@ void verify(int no_time_steps, char* class_npb, boolean* verified){
 	 */
 	error_norm(xce);
 	compute_rhs();
+	
+	if (compute_rhs_no_sync) {
+		sync_by_z();
+	}
+
 	rhs_norm(xcr);
 	for(m=0;m<5;m++){xcr[m]=xcr[m]/dt;}
 	*class_npb='U';
@@ -2177,17 +2207,13 @@ void x_solve(){
 
 	if(timeron && thread_id==0){timer_start(T_XSOLVE);}
 
-	int scale = nz2, partition_size = 0, begin = 0, end = scale;
-	partition(partition_size, begin, end, scale);
-
 	#pragma omp for
-	for(k=begin; k<=end; k++){
+	for(k=1; k<=nz2; k++){
 		double cv[PROBLEM_SIZE], rhon[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
 		double lhsm[IMAXP+1][IMAXP+1][5];
 
-		/// init lhs, lhsp, lhsm
 		for(j=1; j<=ny2; j++){
 			for(m=0; m<5; m++){
 				lhs[j][0][m]=0.0;
@@ -2447,9 +2473,6 @@ void x_solve(){
 			}
 		}
 	}
-	
-	sync_buffer(rhs, begin, end, partition_size, 1, scale);
-
 	if(timeron && thread_id==0){timer_stop(T_XSOLVE);}
 	/*
 	 * ---------------------------------------------------------------------
@@ -2473,13 +2496,8 @@ void y_solve(){
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_YSOLVE);}
-
-	int partition_size = 0, begin = 0, end = 0, scale = grid_points[2] - 2;
-	partition(partition_size, begin, end, scale);
-	
 	#pragma omp for
-	// for(k=1; k<=grid_points[2]-2; k++){
-	for(k=begin; k<=end; k++){
+	for(k=1; k<=grid_points[2]-2; k++){
 		double cv[PROBLEM_SIZE], rhoq[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
@@ -2741,9 +2759,6 @@ void y_solve(){
 			}
 		}
 	}
-	
-	sync_buffer(rhs, begin, end, partition_size, 1, scale);
-
 	if(timeron && thread_id==0){timer_stop(T_YSOLVE);}
 	pinvr();
 }
@@ -2762,10 +2777,6 @@ void z_solve(){
 	int thread_id = omp_get_thread_num();
 	
 	if(timeron && thread_id==0){timer_start(T_ZSOLVE);}
-	
-	// int scale = KMAX, begin = 0, end = 0, partition_size = 0;
-	// partition(partition_size, begin, end, scale);
-
 	#pragma omp for
 	for(j=1; j<=ny2; j++){
 		double cv[PROBLEM_SIZE], rhos[PROBLEM_SIZE];
@@ -2773,7 +2784,6 @@ void z_solve(){
 		double lhsp[IMAXP+1][IMAXP+1][5];
 		double lhsm[IMAXP+1][IMAXP+1][5];
 
-		/// init {lhs, lhsp, lhsm} 
 		for(i=1; i<=nx2; i++){
 			for(m=0; m<5; m++){
 				lhs[0][i][m]=0.0;
@@ -2798,18 +2808,12 @@ void z_solve(){
 		 * first fill the lhs for the u-eigenvalue                          
 		 * ---------------------------------------------------------------------
 		 */
-		/// Input:	c3c4, dz4, con43, dz5, c1c5, dzmax, dz1
-		///			rho_i[0:nz2+1][1:ny2][1:nx2]
-		///			ws[0:nz2+1][1:ny2][1:nx2]
 		for(i=1; i<=nx2; i++){
-			/// init local variables
 			for(k=0; k<=nz2+1; k++){
 				ru1=c3c4*rho_i[k][j][i];
 				cv[k]=ws[k][j][i];
 				rhos[k]=max(max(dz4+con43*ru1, dz5+c1c5*ru1), max(dzmax+ru1, dz1));
 			}
-			/// Input:	dttz2, dttz1, c2dttz1
-			/// Output:	lhs[0:nz2+1][1:nx2][0:4]	
 			for(k=1; k<=nz2; k++){
 				lhs[k][i][0]=0.0;
 				lhs[k][i][1]=-dttz2*cv[k-1]-dttz1*rhos[k-1];
@@ -2823,9 +2827,6 @@ void z_solve(){
 		 * add fourth order dissipation                                  
 		 * ---------------------------------------------------------------------
 		 */
-		/// Input:	lhs[1:2][1:nx2][1:4]
-		///			comz1, comz4, comz5, comz6
-		/// Output:	lhs[1:2][1:nx2][1:4]
 		for(i=1; i<=nx2; i++){
 			k=1;
 			lhs[k][i][2]=lhs[k][i][2]+comz5;
@@ -2837,9 +2838,6 @@ void z_solve(){
 			lhs[k][i][3]=lhs[k][i][3]-comz4;
 			lhs[k][i][4]=lhs[k][i][4]+comz1;
 		}
-		/// Input:	lhs[3:nz2-2][1:nx2][0:4]
-		///			comz1, comz4, comz6
-		/// Output:	lhs[3:nz2-2][1:nx2][0:4]
 		for(k=3; k<=nz2-2; k++){
 			for(i=1; i<=nx2; i++){
 				lhs[k][i][0]=lhs[k][i][0]+comz1;
@@ -2849,9 +2847,6 @@ void z_solve(){
 				lhs[k][i][4]=lhs[k][i][4]+comz1;
 			}
 		}
-		/// Input:	lhs[nz2-1:nz2][1:nx2][0:3]
-		///			comz1, comz4, comz5, comz6
-		/// Output:	lhs[nz2-1:nz2][1:nx2][0:3]
 		for(i=1; i<=nx2; i++){
 			k=nz2-1;
 			lhs[k][i][0]=lhs[k][i][0]+comz1;
@@ -2863,14 +2858,11 @@ void z_solve(){
 			lhs[k][i][1]=lhs[k][i][1]-comz4;
 			lhs[k][i][2]=lhs[k][i][2]+comz5;
 		}
-
 		/*
 		 * ---------------------------------------------------------------------
 		 * subsequently, fill the other factors (u+c), (u-c) 
 		 * ---------------------------------------------------------------------
 		 */
-		/// Output: lhsp[1:nz2][1:nx2][0:4] (local)
-		/// 		lhsm[1:nz2][1:nx2][0:4] (local)
 		for(k=1; k<=nz2; k++){
 			for(i=1; i<=nx2; i++){
 				lhsp[k][i][0]=lhs[k][i][0];
@@ -2878,7 +2870,6 @@ void z_solve(){
 				lhsp[k][i][2]=lhs[k][i][2];
 				lhsp[k][i][3]=lhs[k][i][3]+dttz2*speed[k+1][j][i];
 				lhsp[k][i][4]=lhs[k][i][4];
-
 				lhsm[k][i][0]=lhs[k][i][0];
 				lhsm[k][i][1]=lhs[k][i][1]+dttz2*speed[k-1][j][i];
 				lhsm[k][i][2]=lhs[k][i][2];
@@ -2886,32 +2877,26 @@ void z_solve(){
 				lhsm[k][i][4]=lhs[k][i][4];
 			}
 		}
-
 		/*
 		 * ---------------------------------------------------------------------
 		 * FORWARD ELIMINATION  
 		 * ---------------------------------------------------------------------
 		 */
-		/// Output:	lhs[0:grid_points[2]][1:nx2][1:4] (local)
-		/// 		rhs[0:grid_points[2]][1:ny2][1:nx2][0:3] (local)
 		for(k=0; k<=grid_points[2]-3; k++){
 			k1=k+1;
 			k2=k+2;
 			for(i=1; i<=nx2; i++){
 				fac1=1.0/lhs[k][i][2];
-
 				lhs[k][i][3]=fac1*lhs[k][i][3];
 				lhs[k][i][4]=fac1*lhs[k][i][4];
 				for(m=0; m<3; m++){
 					rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
 				}
-
 				lhs[k1][i][2]=lhs[k1][i][2]-lhs[k1][i][1]*lhs[k][i][3];
 				lhs[k1][i][3]=lhs[k1][i][3]-lhs[k1][i][1]*lhs[k][i][4];
 				for(m=0; m<3; m++){
 					rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhs[k1][i][1]*rhs[k][j][i][m];
 				}
-
 				lhs[k2][i][1]=lhs[k2][i][1]-lhs[k2][i][0]*lhs[k][i][3];
 				lhs[k2][i][2]=lhs[k2][i][2]-lhs[k2][i][0]*lhs[k][i][4];
 				for(m=0; m<3; m++){
@@ -2919,7 +2904,6 @@ void z_solve(){
 				}
 			}
 		}
-
 		/*
 		 * ---------------------------------------------------------------------
 		 * the last two rows in this grid block are a bit different, 
@@ -2927,24 +2911,20 @@ void z_solve(){
 		 * elimination of off-diagonal entries
 		 * ---------------------------------------------------------------------
 		 */
-		/// Output:	rhs[]
 		k=grid_points[2]-2;
 		k1=grid_points[2]-1;
 		for(i=1; i<=nx2; i++){
 			fac1=1.0/lhs[k][i][2];
-
 			lhs[k][i][3]=fac1*lhs[k][i][3];
 			lhs[k][i][4]=fac1*lhs[k][i][4];
 			for(m=0; m<3; m++){
 				rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
 			}
-
 			lhs[k1][i][2]=lhs[k1][i][2]-lhs[k1][i][1]*lhs[k][i][3];
 			lhs[k1][i][3]=lhs[k1][i][3]-lhs[k1][i][1]*lhs[k][i][4];
 			for(m=0; m<3; m++){
 				rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhs[k1][i][1]*rhs[k][j][i][m];
 			}
-
 			/*
 			 * ---------------------------------------------------------------------
 			 * scale the last row immediately
@@ -2969,25 +2949,20 @@ void z_solve(){
 				lhsp[k][i][3]=fac1*lhsp[k][i][3];
 				lhsp[k][i][4]=fac1*lhsp[k][i][4];
 				rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
-
 				lhsp[k1][i][2]=lhsp[k1][i][2]-lhsp[k1][i][1]*lhsp[k][i][3];
 				lhsp[k1][i][3]=lhsp[k1][i][3]-lhsp[k1][i][1]*lhsp[k][i][4];
 				rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsp[k1][i][1]*rhs[k][j][i][m];
-
 				lhsp[k2][i][1]=lhsp[k2][i][1]-lhsp[k2][i][0]*lhsp[k][i][3];
 				lhsp[k2][i][2]=lhsp[k2][i][2]-lhsp[k2][i][0]*lhsp[k][i][4];
 				rhs[k2][j][i][m]=rhs[k2][j][i][m]-lhsp[k2][i][0]*rhs[k][j][i][m];
-
 				m=4;
 				fac1=1.0/lhsm[k][i][2];
 				lhsm[k][i][3]=fac1*lhsm[k][i][3];
 				lhsm[k][i][4]=fac1*lhsm[k][i][4];
 				rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
-				
 				lhsm[k1][i][2]=lhsm[k1][i][2]-lhsm[k1][i][1]*lhsm[k][i][3];
 				lhsm[k1][i][3]=lhsm[k1][i][3]-lhsm[k1][i][1]*lhsm[k][i][4];
 				rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsm[k1][i][1]*rhs[k][j][i][m];
-
 				lhsm[k2][i][1]=lhsm[k2][i][1]-lhsm[k2][i][0]*lhsm[k][i][3];
 				lhsm[k2][i][2]=lhsm[k2][i][2]-lhsm[k2][i][0]*lhsm[k][i][4];
 				rhs[k2][j][i][m]=rhs[k2][j][i][m]-lhsm[k2][i][0]*rhs[k][j][i][m];
@@ -3006,21 +2981,17 @@ void z_solve(){
 			lhsp[k][i][3]=fac1*lhsp[k][i][3];
 			lhsp[k][i][4]=fac1*lhsp[k][i][4];
 			rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
-
 			lhsp[k1][i][2]=lhsp[k1][i][2]-lhsp[k1][i][1]*lhsp[k][i][3];
 			lhsp[k1][i][3]=lhsp[k1][i][3]-lhsp[k1][i][1]*lhsp[k][i][4];
 			rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsp[k1][i][1]*rhs[k][j][i][m];
-			
 			m=4;
 			fac1=1.0/lhsm[k][i][2];
 			lhsm[k][i][3]=fac1*lhsm[k][i][3];
 			lhsm[k][i][4]=fac1*lhsm[k][i][4];
 			rhs[k][j][i][m]=fac1*rhs[k][j][i][m];
-
 			lhsm[k1][i][2]=lhsm[k1][i][2]-lhsm[k1][i][1]*lhsm[k][i][3];
 			lhsm[k1][i][3]=lhsm[k1][i][3]-lhsm[k1][i][1]*lhsm[k][i][4];
 			rhs[k1][j][i][m]=rhs[k1][j][i][m]-lhsm[k1][i][1]*rhs[k][j][i][m];
-
 			/*
 			 * ---------------------------------------------------------------------
 			 * scale the last row immediately (some of this is overkill
@@ -3044,7 +3015,6 @@ void z_solve(){
 			rhs[k][j][i][3]=rhs[k][j][i][3]-lhsp[k][i][3]*rhs[k1][j][i][3];
 			rhs[k][j][i][4]=rhs[k][j][i][4]-lhsm[k][i][3]*rhs[k1][j][i][4];
 		}
-
 		/*
 		 * ---------------------------------------------------------------------
 		 * whether or not this is the last processor, we always have
@@ -3075,10 +3045,7 @@ void z_solve(){
 					lhsm[k][i][4]*rhs[k2][j][i][4];
 			}
 		}
-	} // end of parallel for
-
-	// sync_buffer(rhs, begin, end, partition_size, 0, scale);
-
+	}
 	if(timeron && thread_id==0){timer_stop(T_ZSOLVE);}
 	tzetar();
 }
