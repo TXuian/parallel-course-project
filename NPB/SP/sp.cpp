@@ -84,6 +84,14 @@ Authors of the OpenMP code:
 #define T_ADD 15
 #define T_LAST 15
 
+#define DEBUG true
+template <typename... Args>
+inline void debug_printf(Args&&... args) {
+	if (DEBUG) {
+		printf(args...);
+	}
+}
+
 /* global variables */
 #if defined(DO_NOT_ALLOCATE_ARRAYS_WITH_DYNAMIC_MEMORY_AND_AS_SINGLE_DIMENSION)
 static double u[KMAX][JMAXP+1][IMAXP+1][5];
@@ -182,24 +190,6 @@ inline int block_end(int rank, int partition_size, int n) {
 	return min((rank + 1) * partition_size, n);
 }
 
-inline bool is_in_block(const int idx, const int begin, const int end) {
-	return begin <= idx && idx <= end;
-}
-
-template <typename Fn_, typename... Args>
-inline void block_run(const int k, const int j, const int i, 
-					const int begin_z, const int end_z, 
-					const int begin_y, const int end_y,
-					const int begin_x, const int end_x,
-					Fn_&& fn, Args&&... args) {
-	if (is_in_block(k, begin_z, end_z) &&
-		is_in_block(j, begin_y, end_y) &&
-		is_in_block(i, begin_x, end_x)) {
-		// run func
-		fn(args...);
-	}
-}
-
 inline void partition(int& partition_size, int& begin, int& end, int n) {
   	partition_size = static_cast<int>(ceil(n * 1.0 / getCommunicator().world_size));
   	begin = block_begin(getCommunicator().world_rank, partition_size);
@@ -223,12 +213,72 @@ inline void sync_buffer(array_t* buffer, int begin, int end, int partition_size,
 	MPI_Bcast(&buffer[start], buffer_size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 }
 
+struct BlockRange {
+public:
+	int bx, ex;
+	int by, ey;
+	int bz, ez;
+
+	explicit BlockRange(int bx_, int ex_, int by_, int ey_, int bz_, int ez_) 
+	: bx(bx_), ex(ex_), by(by_), ey(ey_), bz(bz_), ez(ez_) {}
+};
+
+static inline bool in_block(const int idx, const int begin, const int end) {
+	return (begin <= idx) && (idx <= end);
+}
+
+template <typename Fn_, typename... Args>
+static inline void block_z_run(const int k, const BlockRange& range,
+							Fn_&& fn, Args&&... args) {
+	if (in_block(k, range.bz, range.ez)) {
+		fn(args...);
+	}
+}
+
+template <typename Fn_, typename... Args>
+static inline void block_zy_run(const int k, const int j,
+							const BlockRange& range,
+							Fn_&& fn, Args&&... args) {
+	if (in_block(k, range.bz, range.ez) &&
+		in_block(j, range.by, range.ey)) {
+		fn(args...);
+	}
+}
+template <typename Fn_, typename... Args>
+static inline void block_zyx_run(const int k, const int j, const int i,
+							const BlockRange& range,
+							Fn_&& fn, Args&&... args) {
+	if (in_block(k, range.bz, range.ez) &&
+		in_block(j, range.by, range.ey) &&
+		in_block(i, range.bx, range.ex)) {
+		fn(args...);
+	}
+}
+
+template <typename Fn_, typename... Args>
+static inline void block_for(int& k, int& j, int& i, const BlockRange& range, Fn_&& fn, Args&&... args) {
+	for(k = range.bz; k <= range.ez; k++) {
+		for(j = range.by; j <= range.ey; j++) {
+			for(i = range.bx; i <= range.ex; i++) {
+				fn(args...);
+			}
+		}
+	}
+}
+
 } // namespace MpiToolKit
 
 using MpiToolKit::getCommunicator;
 using MpiToolKit::partition;
 using MpiToolKit::sync_buffer;
-using MpiToolKit::block_run;
+using MpiToolKit::in_block;
+
+#define BLOCK_ZY_RUN_IF(k, j, bz, ez, by, ey) \
+	if (in_block((k), (bz), (ez)) && \
+		in_block((j), (by), (ey)))
+
+#define BLOCK_Z_RUN_IF(k, bz, ez) \
+	if (in_block((k), (bz), (ez)))
 
 /* function prototypes */
 void add();
@@ -332,7 +382,10 @@ int main(int argc, char* argv[]){
 	 * do one time step to touch all code, and reinitialize
 	 * ---------------------------------------------------------------------
 	 */
-	adi();
+	#pragma omp parallel
+	{
+		adi();
+	}
 	initialize();
 	for(i=1;i<=T_LAST;i++){timer_clear(i);}
 	timer_start(1);
@@ -340,7 +393,10 @@ int main(int argc, char* argv[]){
 		if((step%20)==0||step==1){
 				printf(" Time step %4d\n",step);
 		}
-		adi();
+		#pragma omp parallel
+		{
+			adi();
+		}
 	}
 	timer_stop(1);
 	tmax=timer_read(1);
@@ -421,12 +477,13 @@ void add(){
 
 	if(timeron && thread_id==0){timer_start(T_ADD);}
 	
-	int begin, end, partition_size, scale = nz2;
-	partition(partition_size, begin, end, scale);
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int partition_size_z = 0, scale_z = ny2;
+	partition(partition_size_z, range.bz, range.ez, scale_z);
 
-	#pragma omp parallel for
-	for(k=begin; k<=end; k++){
-		for(j=1; j<=ny2; j++){
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
 			for(i=1; i<=nx2; i++){
 				for(m=0; m<5; m++){
 					u[k][j][i][m]=u[k][j][i][m]+rhs[k][j][i][m];
@@ -434,7 +491,7 @@ void add(){
 			}
 		}
 	}
-	sync_buffer(u, begin, end, partition_size, 1, scale);
+	sync_buffer(u, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 
 	if(timeron && thread_id==0){timer_stop(T_ADD);}
@@ -450,17 +507,18 @@ void adi(){
 }
 
 void compute_rhs(){
+	debug_printf("[%d] %s, %d\n", getCommunicator().world_rank, __func__, __LINE__);
 	int i, j, k, m;
 	double aux, rho_inv, uijk, up1, um1, vijk, vp1, vm1, wijk, wp1, wm1;
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_RHS);}
 
-	int scale_z = KMAX, partition_size_z = 0, begin_z = 0, end_z = scale_z;
-	int scale_y = JMAXP + 1, partition_size_y = 0, begin_y = 0, end_y = scale_y;
-	int scale_x = IMAXP + 1, begin_x = 0, end_x = scale_x;
-	// partition(partition_size_y, begin_y, end_y, scale_y);
-	// partition(partition_size_z, begin_z, end_z, scale_z);
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int partition_size_z = 0, scale_z = nz2;
+	int partition_size_y = 0, scale_y = ny2;
+	partition(partition_size_z, range.bz, range.ez, scale_z);
+	// partition(partition_size_y, range.by, range.ey, scale_y);
 
 	/*
 	 * ---------------------------------------------------------------------
@@ -468,62 +526,27 @@ void compute_rhs(){
 	 * and the speed of sound. 
 	 * ---------------------------------------------------------------------
 	 */
-	#pragma omp parallel for
-	// global: u, rho_i, us, vs, ws, square, qs, c1c2, speed 
-	/// Input: 	u[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1][0:3]
-	///			c1c2
-	///			------------------------------------------------------------------
-	/// Output: rho_i[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
-	/// 		us[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
-	/// 		vs[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
-	/// 		ws[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
-	/// 		square[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
-	/// 		qs[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
-	/// 		speed[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1]
+	#pragma omp for
 	for(k=0; k<=grid_points[2]-1; k++){
 		for(j=0; j<=grid_points[1]-1; j++){
 			for(i=0; i<=grid_points[0]-1; i++){
-				block_run(k, j, i, 
-					begin_z - 2, end_z + 2, 
-					begin_y - 2, end_y + 2,
-					begin_x - 2, end_x + 2,
-					[&](){
-						rho_inv=1.0/u[k][j][i][0];
-						rho_i[k][j][i]=rho_inv;
-						us[k][j][i]=u[k][j][i][1]*rho_inv;
-						vs[k][j][i]=u[k][j][i][2]*rho_inv;
-						ws[k][j][i]=u[k][j][i][3]*rho_inv;
-						square[k][j][i]=0.5*(
-								u[k][j][i][1]*u[k][j][i][1]+ 
-								u[k][j][i][2]*u[k][j][i][2]+
-								u[k][j][i][3]*u[k][j][i][3])*rho_inv;
-						qs[k][j][i]=square[k][j][i]*rho_inv;
-						/*
-						* ---------------------------------------------------------------------
-						* (don't need speed and ainx until the lhs computation)
-						* ---------------------------------------------------------------------
-						*/
-						aux=c1c2*rho_inv*(u[k][j][i][4]-square[k][j][i]);
-						speed[k][j][i]=sqrt(aux);
-					}
-				);
-				// rho_inv=1.0/u[k][j][i][0];
-				// rho_i[k][j][i]=rho_inv;
-				// us[k][j][i]=u[k][j][i][1]*rho_inv;
-				// vs[k][j][i]=u[k][j][i][2]*rho_inv;
-				// ws[k][j][i]=u[k][j][i][3]*rho_inv;
-				// square[k][j][i]=0.5*(
-				// 		u[k][j][i][1]*u[k][j][i][1]+ 
-				// 		u[k][j][i][2]*u[k][j][i][2]+
-				// 		u[k][j][i][3]*u[k][j][i][3])*rho_inv;
-				// qs[k][j][i]=square[k][j][i]*rho_inv;
-				// /*
-				//  * ---------------------------------------------------------------------
-				//  * (don't need speed and ainx until the lhs computation)
-				//  * ---------------------------------------------------------------------
-				//  */
-				// aux=c1c2*rho_inv*(u[k][j][i][4]-square[k][j][i]);
-				// speed[k][j][i]=sqrt(aux);
+				rho_inv=1.0/u[k][j][i][0];
+				rho_i[k][j][i]=rho_inv;
+				us[k][j][i]=u[k][j][i][1]*rho_inv;
+				vs[k][j][i]=u[k][j][i][2]*rho_inv;
+				ws[k][j][i]=u[k][j][i][3]*rho_inv;
+				square[k][j][i]=0.5*(
+						u[k][j][i][1]*u[k][j][i][1]+ 
+						u[k][j][i][2]*u[k][j][i][2]+
+						u[k][j][i][3]*u[k][j][i][3])*rho_inv;
+				qs[k][j][i]=square[k][j][i]*rho_inv;
+				/*
+				 * ---------------------------------------------------------------------
+				 * (don't need speed and ainx until the lhs computation)
+				 * ---------------------------------------------------------------------
+				 */
+				aux=c1c2*rho_inv*(u[k][j][i][4]-square[k][j][i]);
+				speed[k][j][i]=sqrt(aux);
 			}
 		}
 	}
@@ -534,25 +557,13 @@ void compute_rhs(){
 	 * including the boundary                   
 	 * ---------------------------------------------------------------------
 	 */
-	#pragma omp parallel for
-	/// Input:	forcing[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1][0:4]
-	/// Output:	rhs[0:grid_points[2]-1][0:grid_points[1]-1][0:grid_points[0]-1][0:4]
+	#pragma omp for
 	for(k=0; k<=grid_points[2]-1; k++){
 		for(j=0; j<=grid_points[1]-1; j++){
 			for(i=0; i<=grid_points[0]-1; i++){
-				block_run(k, j, i,
-					begin_z - 2, end_z + 2,
-					begin_y - 2, end_y + 2,
-					begin_x - 2, end_x + 2,
-					[&](){
-						for(m=0; m<5; m++){
-							rhs[k][j][i][m]=forcing[k][j][i][m];
-						}
-					}
-				);
-				// for(m=0; m<5; m++){
-				// 	rhs[k][j][i][m]=forcing[k][j][i][m];
-				// }
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=forcing[k][j][i][m];
+				}
 			}
 		}
 	}
@@ -562,93 +573,39 @@ void compute_rhs(){
 	 * ---------------------------------------------------------------------
 	 */
 	if(timeron && thread_id==0){timer_start(T_RHSX);}
-	#pragma omp parallel for
-	for(k=1; k<=nz2; k++){
-		/// Input:	us[1:nz2][1:ny2][1:nx2]
-		///			u[1:nz2][1:ny2][1:nx2][0:4]
-		///			rhs[1:nz2][1:ny2][1:nx2][0:4]
-		///			square[1:nz2][1:ny2][1:nx2]
-		///			vs[1:nz2][1:ny2][1:nx2]
-		///			ws[1:nz2][1:ny2][1:nx2]
-		///			qs[1:nz2][1:ny2][1:nx2]
-		///			rho_i[1:nz2][1:ny2][1:nx2]
-		///			dx1tx1 -> dx5tx1
-		///			xxcon2 -> xxcon5
-		///			tx2
-		///			c1, c2
-		/// Output:	rhs[1:nz2][1:ny2][1:nx2][0:4]
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
-				block_run(k, j, i,
-					begin_z, end_z,
-					begin_y, end_y,
-					begin_x, end_x,
-					[&](){
-						uijk=us[k][j][i];
-						up1=us[k][j][i+1];
-						um1=us[k][j][i-1];
-
-						rhs[k][j][i][0]=rhs[k][j][i][0]+
-							dx1tx1 * (u[k][j][i+1][0]-2.0*u[k][j][i][0]+u[k][j][i-1][0])-
-							tx2 * (u[k][j][i+1][1]-u[k][j][i-1][1]);
-
-						rhs[k][j][i][1]=rhs[k][j][i][1]+
-							dx2tx1 * (u[k][j][i+1][1]-2.0*u[k][j][i][1]+u[k][j][i-1][1])+
-							xxcon2 * con43 * (up1-2.0*uijk+um1)-
-							tx2 * ( u[k][j][i+1][1] * up1 - 
-									u[k][j][i-1][1] * um1 +
-									(u[k][j][i+1][4] - square[k][j][i+1]- u[k][j][i-1][4] + square[k][j][i-1]) * c2);
-									
-						rhs[k][j][i][2]=rhs[k][j][i][2]+
-							dx3tx1 * (u[k][j][i+1][2] - 2.0*u[k][j][i][2] + u[k][j][i-1][2])+
-							xxcon2 * (vs[k][j][i+1] - 2.0*vs[k][j][i] + vs[k][j][i-1])-
-							tx2 * (u[k][j][i+1][2]*up1 - u[k][j][i-1][2]*um1);
-
-						rhs[k][j][i][3]=rhs[k][j][i][3]+
-							dx4tx1 * (u[k][j][i+1][3] - 2.0*u[k][j][i][3] + u[k][j][i-1][3])+
-							xxcon2 * (ws[k][j][i+1] - 2.0*ws[k][j][i] + ws[k][j][i-1])-
-							tx2 * (u[k][j][i+1][3]*up1 - u[k][j][i-1][3]*um1);
-
-						rhs[k][j][i][4]=rhs[k][j][i][4]+
-							dx5tx1 * (u[k][j][i+1][4] - 2.0*u[k][j][i][4] + u[k][j][i-1][4])+
-							xxcon3 * (qs[k][j][i+1]-2.0*qs[k][j][i]+qs[k][j][i-1])+
-							xxcon4 * (up1*up1-2.0*uijk*uijk+um1*um1)+
-							xxcon5 * ( u[k][j][i+1][4]*rho_i[k][j][i+1]- 
-										2.0*u[k][j][i][4]*rho_i[k][j][i]+
-										u[k][j][i-1][4]*rho_i[k][j][i-1])-
-							tx2 * ((c1*u[k][j][i+1][4]-c2*square[k][j][i+1]) * up1-
-									(c1*u[k][j][i-1][4]-c2*square[k][j][i-1]) * um1);
-					}
-				);
-				// uijk=us[k][j][i];
-				// up1=us[k][j][i+1];
-				// um1=us[k][j][i-1];
-				// rhs[k][j][i][0]=rhs[k][j][i][0]+
-				// 	dx1tx1 * (u[k][j][i+1][0]-2.0*u[k][j][i][0]+u[k][j][i-1][0])-
-				// 	tx2 * (u[k][j][i+1][1]-u[k][j][i-1][1]);
-				// rhs[k][j][i][1]=rhs[k][j][i][1]+
-				// 	dx2tx1 * (u[k][j][i+1][1]-2.0*u[k][j][i][1]+u[k][j][i-1][1])+
-				// 	xxcon2 * con43 * (up1-2.0*uijk+um1)-
-				// 	tx2 * ( u[k][j][i+1][1] * up1 - 
-				// 			u[k][j][i-1][1] * um1 +
-				// 			(u[k][j][i+1][4] - square[k][j][i+1]- u[k][j][i-1][4] + square[k][j][i-1]) * c2);
-				// rhs[k][j][i][2]=rhs[k][j][i][2]+
-				// 	dx3tx1 * (u[k][j][i+1][2] - 2.0*u[k][j][i][2] + u[k][j][i-1][2])+
-				// 	xxcon2 * (vs[k][j][i+1] - 2.0*vs[k][j][i] + vs[k][j][i-1])-
-				// 	tx2 * (u[k][j][i+1][2]*up1 - u[k][j][i-1][2]*um1);
-				// rhs[k][j][i][3]=rhs[k][j][i][3]+
-				// 	dx4tx1 * (u[k][j][i+1][3] - 2.0*u[k][j][i][3] + u[k][j][i-1][3])+
-				// 	xxcon2 * (ws[k][j][i+1] - 2.0*ws[k][j][i] + ws[k][j][i-1])-
-				// 	tx2 * (u[k][j][i+1][3]*up1 - u[k][j][i-1][3]*um1);
-				// rhs[k][j][i][4]=rhs[k][j][i][4]+
-				// 	dx5tx1 * (u[k][j][i+1][4] - 2.0*u[k][j][i][4] + u[k][j][i-1][4])+
-				// 	xxcon3 * (qs[k][j][i+1]-2.0*qs[k][j][i]+qs[k][j][i-1])+
-				// 	xxcon4 * (up1*up1-2.0*uijk*uijk+um1*um1)+
-				// 	xxcon5 * ( u[k][j][i+1][4]*rho_i[k][j][i+1]- 
-				// 				2.0*u[k][j][i][4]*rho_i[k][j][i]+
-				// 				u[k][j][i-1][4]*rho_i[k][j][i-1])-
-				// 	tx2 * ((c1*u[k][j][i+1][4]-c2*square[k][j][i+1]) * up1-
-				// 			(c1*u[k][j][i-1][4]-c2*square[k][j][i-1]) * um1);
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
+				uijk=us[k][j][i];
+				up1=us[k][j][i+1];
+				um1=us[k][j][i-1];
+				rhs[k][j][i][0]=rhs[k][j][i][0]+dx1tx1* 
+					(u[k][j][i+1][0]-2.0*u[k][j][i][0]+u[k][j][i-1][0])-
+					tx2*(u[k][j][i+1][1]-u[k][j][i-1][1]);
+				rhs[k][j][i][1]=rhs[k][j][i][1]+dx2tx1* 
+					(u[k][j][i+1][1]-2.0*u[k][j][i][1]+u[k][j][i-1][1])+
+					xxcon2*con43*(up1-2.0*uijk+um1)-
+					tx2*(u[k][j][i+1][1]*up1-u[k][j][i-1][1]*um1+
+							(u[k][j][i+1][4]-square[k][j][i+1]-
+							 u[k][j][i-1][4]+square[k][j][i-1])*c2);
+				rhs[k][j][i][2]=rhs[k][j][i][2]+dx3tx1* 
+					(u[k][j][i+1][2]-2.0*u[k][j][i][2]+u[k][j][i-1][2])+
+					xxcon2*(vs[k][j][i+1]-2.0*vs[k][j][i]+vs[k][j][i-1])-
+					tx2*(u[k][j][i+1][2]*up1-u[k][j][i-1][2]*um1);
+				rhs[k][j][i][3]=rhs[k][j][i][3]+dx4tx1* 
+					(u[k][j][i+1][3]-2.0*u[k][j][i][3]+u[k][j][i-1][3])+
+					xxcon2*(ws[k][j][i+1]-2.0*ws[k][j][i]+ws[k][j][i-1])-
+					tx2*(u[k][j][i+1][3]*up1-u[k][j][i-1][3]*um1);
+				rhs[k][j][i][4]=rhs[k][j][i][4]+dx5tx1* 
+					(u[k][j][i+1][4]-2.0*u[k][j][i][4]+u[k][j][i-1][4])+
+					xxcon3*(qs[k][j][i+1]-2.0*qs[k][j][i]+qs[k][j][i-1])+
+					xxcon4*(up1*up1-2.0*uijk*uijk+um1*um1)+
+					xxcon5*(u[k][j][i+1][4]*rho_i[k][j][i+1]- 
+							2.0*u[k][j][i][4]*rho_i[k][j][i]+
+							u[k][j][i-1][4]*rho_i[k][j][i-1])-
+					tx2*((c1*u[k][j][i+1][4]-c2*square[k][j][i+1])*up1-
+							(c1*u[k][j][i-1][4]-c2*square[k][j][i-1])*um1);
 			}
 		}
 		/*
@@ -656,77 +613,51 @@ void compute_rhs(){
 		 * add fourth order xi-direction dissipation               
 		 * ---------------------------------------------------------------------
 		 */
-		/// Input: rhs[1:nz2][1:ny2][1]
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			i=1;
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-							(5.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
-					}
+			if(in_block(i, range.bx, range.ex)) {
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+						(5.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
 				}
-			);
+			}
 			i=2;
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-							(-4.0*u[k][j][i-1][m]+6.0*u[k][j][i][m]-
-							4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
-					}
+			if(in_block(i, range.bx, range.ex)) {
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+						(-4.0*u[k][j][i-1][m]+6.0*u[k][j][i][m]-
+						4.0*u[k][j][i+1][m]+u[k][j][i+2][m]);
 				}
-			);
-		}
-		for(j=1; j<=ny2; j++){
-			for(i=3; i<=nx2-2; i++){
-				block_run(k, j, i,
-					begin_z, end_z,
-					begin_y, end_y,
-					begin_x, end_x,
-					[&](){
-						for(m=0; m<5; m++){
-							rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-								(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
-								6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+ 
-								u[k][j][i+2][m]);
-						}
-					}
-				);
 			}
 		}
-		for(j=1; j<=ny2; j++){
+
+		for(j=range.by; j<=range.ey; j++){
+			for(i=max(3, range.bx); i<=min(nx2-2, range.ex); i++){
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+						(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
+						 6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]+ 
+						 u[k][j][i+2][m]);
+				}
+			}
+		}
+
+		for(j=range.by; j<=range.ey; j++){
 			i=nx2-1;
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
-							(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
-							6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]);
-					}
+			if(in_block(i, range.bx, range.ex)) {
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
+						(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+ 
+						6.0*u[k][j][i][m]-4.0*u[k][j][i+1][m]);
 				}
-			);
+			}
 			i=nx2;
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
-							(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+5.0*u[k][j][i][m]);
-					}
+			if(in_block(i, range.bx, range.ex)) {
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m] = rhs[k][j][i][m]-dssp*
+						(u[k][j][i-2][m]-4.0*u[k][j][i-1][m]+5.0*u[k][j][i][m]);
 				}
-			);
+			}
 		}
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSX);}
@@ -736,51 +667,39 @@ void compute_rhs(){
 	 * ---------------------------------------------------------------------
 	 */
 	if(timeron && thread_id==0){timer_start(T_RHSY);}
-	#pragma omp parallel for
-	for(k=1; k<=nz2; k++){
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
-				block_run(k, j, i,
-					begin_z, end_z,
-					begin_y, end_y,
-					begin_x, end_x,
-					[&](){
-						vijk=vs[k][j][i];
-						vp1=vs[k][j+1][i];
-						vm1=vs[k][j-1][i];
-
-						rhs[k][j][i][0]=rhs[k][j][i][0]+dy1ty1* 
-							(u[k][j+1][i][0]-2.0*u[k][j][i][0]+u[k][j-1][i][0])-
-							ty2*(u[k][j+1][i][2]-u[k][j-1][i][2]);
-
-						rhs[k][j][i][1]=rhs[k][j][i][1]+dy2ty1* 
-							(u[k][j+1][i][1]-2.0*u[k][j][i][1]+u[k][j-1][i][1])+
-							yycon2*(us[k][j+1][i]-2.0*us[k][j][i]+us[k][j-1][i])-
-							ty2*(u[k][j+1][i][1]*vp1-u[k][j-1][i][1]*vm1);
-							
-						rhs[k][j][i][2]=rhs[k][j][i][2]+dy3ty1* 
-							(u[k][j+1][i][2]-2.0*u[k][j][i][2]+u[k][j-1][i][2])+
-							yycon2*con43*(vp1-2.0*vijk+vm1)-
-							ty2*(u[k][j+1][i][2]*vp1-u[k][j-1][i][2]*vm1+
-									(u[k][j+1][i][4]-square[k][j+1][i]- 
-									u[k][j-1][i][4]+square[k][j-1][i])* c2);
-
-						rhs[k][j][i][3]=rhs[k][j][i][3]+dy4ty1* 
-							(u[k][j+1][i][3]-2.0*u[k][j][i][3]+u[k][j-1][i][3])+
-							yycon2*(ws[k][j+1][i]-2.0*ws[k][j][i]+ws[k][j-1][i])-
-							ty2*(u[k][j+1][i][3]*vp1-u[k][j-1][i][3]*vm1);
-
-						rhs[k][j][i][4]=rhs[k][j][i][4]+dy5ty1* 
-							(u[k][j+1][i][4]-2.0*u[k][j][i][4]+u[k][j-1][i][4])+
-							yycon3*(qs[k][j+1][i]-2.0*qs[k][j][i]+qs[k][j-1][i])+
-							yycon4*(vp1*vp1- 2.0*vijk*vijk + vm1*vm1)+
-							yycon5*(u[k][j+1][i][4]*rho_i[k][j+1][i]- 
-									2.0*u[k][j][i][4]*rho_i[k][j][i]+
-									u[k][j-1][i][4]*rho_i[k][j-1][i])-
-							ty2*((c1*u[k][j+1][i][4]-c2*square[k][j+1][i])*vp1 -
-									(c1*u[k][j-1][i][4]-c2*square[k][j-1][i])*vm1);
-					}
-				);
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
+				vijk=vs[k][j][i];
+				vp1=vs[k][j+1][i];
+				vm1=vs[k][j-1][i];
+				rhs[k][j][i][0]=rhs[k][j][i][0]+dy1ty1* 
+					(u[k][j+1][i][0]-2.0*u[k][j][i][0]+u[k][j-1][i][0])-
+					ty2*(u[k][j+1][i][2]-u[k][j-1][i][2]);
+				rhs[k][j][i][1]=rhs[k][j][i][1]+dy2ty1* 
+					(u[k][j+1][i][1]-2.0*u[k][j][i][1]+u[k][j-1][i][1])+
+					yycon2*(us[k][j+1][i]-2.0*us[k][j][i]+us[k][j-1][i])-
+					ty2*(u[k][j+1][i][1]*vp1-u[k][j-1][i][1]*vm1);
+				rhs[k][j][i][2]=rhs[k][j][i][2]+dy3ty1* 
+					(u[k][j+1][i][2]-2.0*u[k][j][i][2]+u[k][j-1][i][2])+
+					yycon2*con43*(vp1-2.0*vijk+vm1)-
+					ty2*(u[k][j+1][i][2]*vp1-u[k][j-1][i][2]*vm1+
+							(u[k][j+1][i][4]-square[k][j+1][i]- 
+							 u[k][j-1][i][4]+square[k][j-1][i])* c2);
+				rhs[k][j][i][3]=rhs[k][j][i][3]+dy4ty1* 
+					(u[k][j+1][i][3]-2.0*u[k][j][i][3]+u[k][j-1][i][3])+
+					yycon2*(ws[k][j+1][i]-2.0*ws[k][j][i]+ws[k][j-1][i])-
+					ty2*(u[k][j+1][i][3]*vp1-u[k][j-1][i][3]*vm1);
+				rhs[k][j][i][4]=rhs[k][j][i][4]+dy5ty1* 
+					(u[k][j+1][i][4]-2.0*u[k][j][i][4]+u[k][j-1][i][4])+
+					yycon3*(qs[k][j+1][i]-2.0*qs[k][j][i]+qs[k][j-1][i])+
+					yycon4*(vp1*vp1- 2.0*vijk*vijk + vm1*vm1)+
+					yycon5*(u[k][j+1][i][4]*rho_i[k][j+1][i]- 
+							2.0*u[k][j][i][4]*rho_i[k][j][i]+
+							u[k][j-1][i][4]*rho_i[k][j-1][i])-
+					ty2*((c1*u[k][j+1][i][4]-c2*square[k][j+1][i])*vp1 -
+							(c1*u[k][j-1][i][4]-c2*square[k][j-1][i])*vm1);
 			}
 		}
 		/*
@@ -789,79 +708,55 @@ void compute_rhs(){
 		 * ---------------------------------------------------------------------
 		 */
 		j = 1;
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-							(5.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
-					}
+		if(in_block(j, range.by, range.ey)) {
+			for(i=range.bx; i<=range.ex; i++){
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+						(5.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
 				}
-			);
-		}
-		j = 2;
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m = 0; m < 5; m++) {
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-							(-4.0*u[k][j-1][i][m]+6.0*u[k][j][i][m]-
-							4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
-					}
-				}
-			);
-		}
-		for (j=3; j<=ny2-2; j++){
-			for(i=1; i<=nx2; i++){
-				block_run(k, j, i,
-					begin_z, end_z,
-					begin_y, end_y,
-					begin_x, end_x,
-					[&](){
-						for(m=0; m<5; m++){
-							rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-								(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
-								6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+ 
-								u[k][j+2][i][m]);
-						}
-					}
-				);
 			}
 		}
-		j=ny2-1;
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-							(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
-							6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]);
-					}
+
+		j = 2;
+		if(in_block(j, range.by, range.ey)) {
+			for(i=range.bx; i<=range.ex; i++){
+				for(m = 0; m < 5; m++) {
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+						(-4.0*u[k][j-1][i][m]+6.0*u[k][j][i][m]-
+						4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
 				}
-			);
+			}
 		}
-		j=ny2;
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-							(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+5.0*u[k][j][i][m]);
-					}
+		for (j=max(3, range.by); j<=min(range.ey, ny2-2); j++){
+			for(i=range.bx; i<=range.ex; i++){
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
+						 6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+ 
+						 u[k][j+2][i][m]);
 				}
-			);
+			}
+		}
+
+		j=ny2-1;
+		if(in_block(j, range.by, range.ey)) {
+			for(i=range.bx; i<=range.ex; i++){
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
+						6.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]);
+				}
+			}
+		}
+
+		j=ny2;
+		if(in_block(j, range.by, range.ey)) {
+			for(i=range.bx; i<=range.ex; i++){
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+5.0*u[k][j][i][m]);
+				}
+			}
 		}
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSY);}
@@ -871,49 +766,39 @@ void compute_rhs(){
 	 * ---------------------------------------------------------------------
 	 */
 	if(timeron && thread_id==0){timer_start(T_RHSZ);}
-	#pragma omp parallel for
-	for(k=1; k<=nz2; k++){
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
-				block_run(k, j, i,
-					begin_z, end_z,
-					begin_y, end_y,
-					begin_x, end_x,
-					[&](){
-						wijk=ws[k][j][i];
-						wp1=ws[k+1][j][i];
-						wm1=ws[k-1][j][i];
-						rhs[k][j][i][0]=rhs[k][j][i][0]+dz1tz1* 
-							(u[k+1][j][i][0]-2.0*u[k][j][i][0]+u[k-1][j][i][0])-
-							tz2*(u[k+1][j][i][3]-u[k-1][j][i][3]);
-						rhs[k][j][i][1]=rhs[k][j][i][1]+dz2tz1* 
-							(u[k+1][j][i][1]-2.0*u[k][j][i][1]+u[k-1][j][i][1])+
-							zzcon2*(us[k+1][j][i]-2.0*us[k][j][i]+us[k-1][j][i])-
-							tz2*(u[k+1][j][i][1]*wp1-u[k-1][j][i][1]*wm1);
-
-						rhs[k][j][i][2]=rhs[k][j][i][2]+dz3tz1* 
-							(u[k+1][j][i][2]-2.0*u[k][j][i][2]+u[k-1][j][i][2])+
-							zzcon2*(vs[k+1][j][i]-2.0*vs[k][j][i]+vs[k-1][j][i])-
-							tz2*(u[k+1][j][i][2]*wp1-u[k-1][j][i][2]*wm1);
-
-						rhs[k][j][i][3]=rhs[k][j][i][3]+dz4tz1* 
-							(u[k+1][j][i][3]-2.0*u[k][j][i][3]+u[k-1][j][i][3])+
-							zzcon2*con43*(wp1-2.0*wijk+wm1)-
-							tz2*(u[k+1][j][i][3]*wp1-u[k-1][j][i][3]*wm1+
-									(u[k+1][j][i][4]-square[k+1][j][i]- 
-									u[k-1][j][i][4]+square[k-1][j][i])*c2);
-
-						rhs[k][j][i][4]=rhs[k][j][i][4]+dz5tz1* 
-							(u[k+1][j][i][4]-2.0*u[k][j][i][4]+u[k-1][j][i][4])+
-							zzcon3*(qs[k+1][j][i]-2.0*qs[k][j][i]+qs[k-1][j][i])+
-							zzcon4*(wp1*wp1-2.0*wijk*wijk+wm1*wm1)+
-							zzcon5*(u[k+1][j][i][4]*rho_i[k+1][j][i]- 
-									2.0*u[k][j][i][4]*rho_i[k][j][i]+
-									u[k-1][j][i][4]*rho_i[k-1][j][i])-
-							tz2*((c1*u[k+1][j][i][4]-c2*square[k+1][j][i])*wp1-
-									(c1*u[k-1][j][i][4]-c2*square[k-1][j][i])*wm1);
-					}
-				);
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
+				wijk=ws[k][j][i];
+				wp1=ws[k+1][j][i];
+				wm1=ws[k-1][j][i];
+				rhs[k][j][i][0]=rhs[k][j][i][0]+dz1tz1* 
+					(u[k+1][j][i][0]-2.0*u[k][j][i][0]+u[k-1][j][i][0])-
+					tz2*(u[k+1][j][i][3]-u[k-1][j][i][3]);
+				rhs[k][j][i][1]=rhs[k][j][i][1]+dz2tz1* 
+					(u[k+1][j][i][1]-2.0*u[k][j][i][1]+u[k-1][j][i][1])+
+					zzcon2*(us[k+1][j][i]-2.0*us[k][j][i]+us[k-1][j][i])-
+					tz2*(u[k+1][j][i][1]*wp1-u[k-1][j][i][1]*wm1);
+				rhs[k][j][i][2]=rhs[k][j][i][2]+dz3tz1* 
+					(u[k+1][j][i][2]-2.0*u[k][j][i][2]+u[k-1][j][i][2])+
+					zzcon2*(vs[k+1][j][i]-2.0*vs[k][j][i]+vs[k-1][j][i])-
+					tz2*(u[k+1][j][i][2]*wp1-u[k-1][j][i][2]*wm1);
+				rhs[k][j][i][3]=rhs[k][j][i][3]+dz4tz1* 
+					(u[k+1][j][i][3]-2.0*u[k][j][i][3]+u[k-1][j][i][3])+
+					zzcon2*con43*(wp1-2.0*wijk+wm1)-
+					tz2*(u[k+1][j][i][3]*wp1-u[k-1][j][i][3]*wm1+
+							(u[k+1][j][i][4]-square[k+1][j][i]- 
+							 u[k-1][j][i][4]+square[k-1][j][i])*c2);
+				rhs[k][j][i][4]=rhs[k][j][i][4]+dz5tz1* 
+					(u[k+1][j][i][4]-2.0*u[k][j][i][4]+u[k-1][j][i][4])+
+					zzcon3*(qs[k+1][j][i]-2.0*qs[k][j][i]+qs[k-1][j][i])+
+					zzcon4*(wp1*wp1-2.0*wijk*wijk+wm1*wm1)+
+					zzcon5*(u[k+1][j][i][4]*rho_i[k+1][j][i]- 
+							2.0*u[k][j][i][4]*rho_i[k][j][i]+
+							u[k-1][j][i][4]*rho_i[k-1][j][i])-
+					tz2*((c1*u[k+1][j][i][4]-c2*square[k+1][j][i])*wp1-
+							(c1*u[k-1][j][i][4]-c2*square[k-1][j][i])*wm1);
 			}
 		}
 	}
@@ -922,115 +807,95 @@ void compute_rhs(){
 	 * add fourth order zeta-direction dissipation                
 	 * ---------------------------------------------------------------------
 	 */
+
 	k=1;
-	#pragma omp parallel for
-	for(j=1; j<=ny2; j++){
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-							(5.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
-					}
-				}
-			);
+	#pragma omp for
+	for(j=range.by; j<=range.ey; j++){
+		MpiToolKit::block_zy_run(k, j, range, [&](){
+		for(i=range.bx; i<=range.ex; i++){
+			for(m=0; m<5; m++){
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+					(5.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
+			}
 		}
+		});
 	}
+	
 	k=2;
-	#pragma omp parallel for
-	for(j=1; j<=ny2; j++){
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-							(-4.0*u[k-1][j][i][m]+6.0*u[k][j][i][m]-
-							4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
-					}
-				}
-			);
+	#pragma omp for
+	for(j=range.by; j<=range.ey; j++){
+		MpiToolKit::block_zy_run(k, j, range, [&](){
+		for(i=range.bx; i<=range.ex; i++){
+			for(m=0; m<5; m++){
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+					(-4.0*u[k-1][j][i][m]+6.0*u[k][j][i][m]-
+					 4.0*u[k+1][j][i][m]+u[k+2][j][i][m]);
+			}
 		}
+		});
 	}
-	#pragma omp parallel for
-	for(k=3; k<=nz2-2; k++){
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
-				block_run(k, j, i,
-					begin_z, end_z,
-					begin_y, end_y,
-					begin_x, end_x,
-					[&](){
-						for(m=0; m<5; m++){
-							rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
-								(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
-								6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+ 
-								u[k+2][j][i][m]);
-						}	
-					}
-				);
+
+	#pragma omp for
+	for(k=max(3, range.bz); k<=min(range.ez, nz2-2); k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
+						(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
+						 6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]+ 
+						 u[k+2][j][i][m]);
+				}
 			}
 		}
 	}
+
 	k=nz2-1;
-	#pragma omp parallel for
-	for(j=1; j<=ny2; j++){
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-							(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
-							6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]);
-					}
-				}
-			);
+	// MpiToolKit::block_z_run(k, range, [&]() {
+	if(in_block(k, range.bz, range.ez)) {
+	#pragma omp for
+	for(int j=range.by; j<=range.ey; j++){
+		for(int i=range.bx; i<=range.ex; i++){
+			for(int m=0; m<5; m++){
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
+					 6.0*u[k][j][i][m]-4.0*u[k+1][j][i][m]);
+			}
 		}
 	}
+	// });
+	}
+
 	k=nz2;
-	#pragma omp parallel for
-	for(j=1; j<=ny2; j++){
-		for(i=1; i<=nx2; i++){
-			block_run(k, j, i,
-				begin_z, end_z,
-				begin_y, end_y,
-				begin_x, end_x,
-				[&](){
-					for(m=0; m<5; m++){
-						rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
-							(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+5.0*u[k][j][i][m]);
-					}
-				}
-			);
+	// MpiToolKit::block_z_run(k, range, [&]() {
+	if(in_block(k, range.bz, range.ez)) {
+	#pragma omp for
+	for(int j=range.by; j<=range.ey; j++){
+		for(int i=range.bx; i<=range.ex; i++){
+			for(int m=0; m<5; m++){
+				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
+					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+5.0*u[k][j][i][m]);
+			}
 		}
+	}
+	// });
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSZ);}
-	#pragma omp parallel for
-	for(k=1; k<=nz2; k++){
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
-				block_run(k, j, i,
-					begin_z, end_z,
-					begin_y, end_y,
-					begin_x, end_x,
-					[&](){
-						for(m=0; m<5; m++){
-							rhs[k][j][i][m]=rhs[k][j][i][m]*dt;
-						}
-					}
-				);
+
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
+				for(m=0; m<5; m++){
+					rhs[k][j][i][m]=rhs[k][j][i][m]*dt;
+				}
 			}
 		}
 	}
+
+	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
+
 	if(timeron && thread_id==0){timer_stop(T_RHS);}
+	debug_printf("[%d] %s, %d\n", getCommunicator().world_rank, __func__, __LINE__);
 }
 
 /*
@@ -1611,14 +1476,15 @@ void ninvr(){
 	if(timeron && thread_id==0){timer_start(T_NINVR);}
 
 
-	int scale = nz2, partition_size = 0, begin = 0, end = 0;
-	partition(partition_size, begin, end, scale);
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int partition_size_z = 0, scale_z = nz2;
+	partition(partition_size_z, range.bz, range.ez, scale_z);
 
-	#pragma omp parallel for
-	for(k=begin; k<=end; k++){
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
-				// local r1 to r5
+	// #pragma omp for
+	#pragma omp for 
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++) {
 				r1=rhs[k][j][i][0];
 				r2=rhs[k][j][i][1];
 				r3=rhs[k][j][i][2];
@@ -1636,7 +1502,7 @@ void ninvr(){
 			}
 		}
 	}
-	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_NINVR);}
 }
@@ -1653,16 +1519,17 @@ void pinvr(){
 
 	if(timeron && thread_id==0){timer_start(T_PINVR);}
 
-	int scale = nz2, partition_size = 0, begin = 0, end = 0;
-	partition(partition_size, begin, end, scale);
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int partition_size_z = 0, scale_z = nz2;
+	partition(partition_size_z, range.bz, range.ez, scale_z);
 
 	/// Input:	rhs[1:nz2][1:ny2][1:nx2]
 	///			bt
 	/// Output:	rhs[1:nz2][1:ny2][1:nx2]
-	#pragma omp parallel for
-	for(k=begin; k<=end; k++){
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
 				r1=rhs[k][j][i][0];
 				r2=rhs[k][j][i][1];
 				r3=rhs[k][j][i][2];
@@ -1678,7 +1545,7 @@ void pinvr(){
 			}
 		}
 	}
-	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_PINVR);}
 }
@@ -1903,20 +1770,22 @@ void set_constants(){
  * ---------------------------------------------------------------------
  */
 void txinvr(){
+	debug_printf("[%d] %s, %d\n", getCommunicator().world_rank, __func__, __LINE__);
 	int i, j, k;
 	double t1, t2, t3, ac, ru1, uu, vv, ww, r1, r2, r3, r4, r5, ac2inv;
 	int thread_id = omp_get_thread_num();
 
 	if(timeron && thread_id==0){timer_start(T_TXINVR);}
 
-	int scale = nz2, begin = 0, end = 0, partition_size = 0;
-	partition(partition_size, begin, end, scale);
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int partition_size_z = 0, scale_z = nz2;
+	partition(partition_size_z, range.bz, range.ez, scale_z);
 
-	#pragma omp parallel for
-	for(k=begin; k<=end; k++){
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
         // plane
-        for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
+        for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
 				ru1=rho_i[k][j][i];
 				uu=us[k][j][i];
 				vv=vs[k][j][i];
@@ -1941,7 +1810,7 @@ void txinvr(){
 			}
 		}
 	}
-	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_TXINVR);}
 }
@@ -1958,22 +1827,14 @@ void tzetar(){
 
 	if(timeron && thread_id==0){timer_start(T_TZETAR);}
 
-	int scale = nz2, partition_size = 0, begin = 0, end = 0;
-	partition(partition_size, begin, end, scale);
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int partition_size_z = 0, scale_z = nz2;
+	partition(partition_size_z, range.bz, range.ez, scale_z);
 
-	#pragma omp parallel for
-	/// Input:	us[1:nz2][1:ny2][1:nx2]
-	/// 		vs[1:nz2][1:ny2][1:nx2]
-	/// 		ws[1:nz2][1:ny2][1:nx2]
-	/// 		speed[1:nz2][1:ny2][1:nx2]
-	/// 		rhs[1:nz2][1:ny2][1:nx2][0:4]
-	/// 		u[1:nz2][1:ny2][1:nx2][0]
-	/// 		qs[1:nz2][1:ny2][1:nx2]
-	/// 		bt, c2iv
-	///	Output:	rhs[1:nz2][1:ny2][1:nx2][0:4]
-	for(k=1; k<=nz2; k++){
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
+	#pragma omp for
+	for(k=range.bz; k<=range.ez; k++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
 				xvel=us[k][j][i];
 				yvel=vs[k][j][i];
 				zvel=ws[k][j][i];
@@ -1999,7 +1860,7 @@ void tzetar(){
 			}
 		}
 	}
-	sync_buffer(rhs, begin, end, partition_size, 1, scale);
+	sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_TZETAR);}
 }
@@ -2319,7 +2180,7 @@ void x_solve(){
 	int scale = nz2, partition_size = 0, begin = 0, end = scale;
 	partition(partition_size, begin, end, scale);
 
-	#pragma omp parallel for
+	#pragma omp for
 	for(k=begin; k<=end; k++){
 		double cv[PROBLEM_SIZE], rhon[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
@@ -2616,7 +2477,7 @@ void y_solve(){
 	int partition_size = 0, begin = 0, end = 0, scale = grid_points[2] - 2;
 	partition(partition_size, begin, end, scale);
 	
-	#pragma omp parallel for
+	#pragma omp for
 	// for(k=1; k<=grid_points[2]-2; k++){
 	for(k=begin; k<=end; k++){
 		double cv[PROBLEM_SIZE], rhoq[PROBLEM_SIZE];
@@ -2905,7 +2766,7 @@ void z_solve(){
 	// int scale = KMAX, begin = 0, end = 0, partition_size = 0;
 	// partition(partition_size, begin, end, scale);
 
-	#pragma omp parallel for
+	#pragma omp for
 	for(j=1; j<=ny2; j++){
 		double cv[PROBLEM_SIZE], rhos[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
