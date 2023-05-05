@@ -87,17 +87,10 @@ Authors of the OpenMP code:
 #ifndef DEBUG
 #define DEBUG false
 // #define DEBUG true
+const int print_process = 0;
 #endif
 const bool compute_rhs_no_sync = true;
 // const bool compute_rhs_no_sync = false;
-
-template <typename... Args>
-inline void debug_printf(Args&&... args) {
-	if (DEBUG) {
-		printf(args...);
-	}
-}
-
 
 #if defined(DO_NOT_ALLOCATE_ARRAYS_WITH_DYNAMIC_MEMORY_AND_AS_SINGLE_DIMENSION)
 static double u[KMAX][JMAXP+1][IMAXP+1][5];
@@ -282,15 +275,29 @@ using MpiToolKit::partition;
 using MpiToolKit::sync_buffer;
 using MpiToolKit::in_block;
 
+template <typename... Args>
+inline void debug_printf(Args&&... args) {
+	if (DEBUG && getCommunicator().world_rank == print_process) {
+		printf(args...);
+	}
+}
+
 inline void debug_print_rhs(int line = 0) {
-	if (getCommunicator().world_rank == 1) {return;}
-	#pragma omp critical
+	if (!DEBUG) { return; }
+	if (getCommunicator().world_rank != print_process) {return;}
+	#pragma omp master
 	{
-		debug_printf("[%d] T%d l(%d) | rhs: ", getCommunicator().world_rank, omp_get_thread_num(), line);
+		printf("[%d] T%d l(%d) | rhs: ", getCommunicator().world_rank, omp_get_thread_num(), line);
 
-		debug_printf("(%lf)(%lf)(%lf)(%lf)(%lf)", rhs[0][0][0][2], rhs[11][0][0][2], rhs[1][1][1][0], rhs[6][1][1][0], rhs[10][1][1][0]);
+		for(int k = 1; k <= nz2; k++) {
+			printf("|{%d}", k);
+			for(int j = 1; j <= ny2; j++) {
+				printf("(%.2lf)", rhs[k][j][2][3]);
+			}
+			printf("|");
+		}
 
-		debug_printf("\n", NULL);
+		printf("\n");
 	}
 }
 
@@ -298,6 +305,75 @@ inline void sync_by_z() {
 	int pz = 0, sz = nz2, bz = 0, ez = 0;
 	partition(pz, bz, ez, sz);
 	sync_buffer(rhs, bz, ez, pz, 1, sz);
+}
+
+inline void sync_by_y() {
+	int py = 0, sy = ny2, by = 0, ey = 0;
+	int bz = 1, ez = nz2;
+	partition(py, by, ey, sy);
+
+	using MpiToolKit::block_begin;
+	using MpiToolKit::block_end;
+
+	for (int p = 0; p < getCommunicator().world_size; p++) {
+		int begin_y = block_begin(p, py),
+			msg_size = (block_end(p, py, sy) - begin_y + 1) * (IMAXP + 1) * 5;
+	
+		debug_printf("by: %d, ey: %d, msg_size: %d\n", by, ey, msg_size);
+
+		for (int bkz = bz; bkz <= ez; bkz++) {
+			// debug_printf("[%d][%d] %.2lf\n", bkz, by, rhs[bkz][by][2][3]);
+			MPI_Bcast(&rhs[bkz][begin_y], msg_size, MPI_DOUBLE, p, MPI_COMM_WORLD);
+		}
+	}
+
+}
+
+inline void sync_alltoallv() {
+	int pz = 0, sz = nz2, bz = 0, ez = 0;
+	int py = 0, sy = ny2, by = 0, ey = 0;
+	partition(pz, bz, ez, sz);
+	partition(py, by, ey, sy);
+
+	using MpiToolKit::block_begin;
+	using MpiToolKit::block_end;
+
+	// double* tmp = new double[py * (IMAXP + 1) * 5];
+	MPI_Request* requests = new MPI_Request[getCommunicator().world_size];
+
+	for(int p = 0; p < getCommunicator().world_size; p++) {
+		if (p == getCommunicator().world_rank) { 
+			requests[p] = MPI_REQUEST_NULL;
+			continue;
+		}
+		int begin_y = block_begin(p, py),
+			end_y = block_end(p, py, sy),
+			msg_size = (block_end(p, py, sy) - begin_y + 1) * (IMAXP + 1) * 5;
+
+		// debug_printf("bz: %d, ez: %d, by: %d, ey: %d, msg_size: %d\n", bz, ez, begin_y, end_y, msg_size);
+		
+		// send
+		for (int bkz = bz; bkz<=ez; bkz++) {
+			MPI_Isend(&rhs[bkz][begin_y], msg_size, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[p]);
+		}
+	}
+
+	int msg_size = (ey - by + 1) * (IMAXP + 1) * 5;
+
+	for(int p = 0; p < getCommunicator().world_size; p++) {
+		if (p == getCommunicator().world_rank) { continue; }
+		int recv_begin_z = block_begin(p, pz),
+			recv_end_z = block_end(p, pz, sz);
+
+		// recv
+		for (int bkz = recv_begin_z; bkz <= recv_end_z; bkz++) {
+			MPI_Recv(&rhs[bkz][by], msg_size, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		}
+	}
+
+	MPI_Waitall(getCommunicator().world_size, requests, MPI_STATUS_IGNORE);
+
+	delete[] requests;
 }
 
 /* function prototypes */
@@ -494,11 +570,11 @@ void add(){
 	if(timeron && thread_id==0){timer_start(T_ADD);}
 	
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
-	int partition_size_z = 0, scale_z = ny2;
+	int partition_size_z = 0, scale_z = nz2;
 	// partition(partition_size_z, range.bz, range.ez, scale_z);
 
-	#pragma omp for
-	for(k=range.bz; k<=range.ez; k++){
+	#pragma omp parallel for
+	for(k=max(0, range.bz-2); k<=min(range.ez+2, nz2); k++){
 		for(j=range.by; j<=range.ey; j++){
 			for(i=range.bx; i<=range.ex; i++){
 				for(m=0; m<5; m++){
@@ -508,32 +584,34 @@ void add(){
 		}
 	}
 	
-	// sync_buffer(u, range.bz, range.ez, partition_size_z, 1, scale_z);
-
 	if(timeron && thread_id==0){timer_stop(T_ADD);}
 }
 
 void adi(){
-	// debug_print_rhs(__LINE__);
 	#pragma omp parallel
 	{
 		compute_rhs();
-		// debug_print_rhs(__LINE__);
 		txinvr();
-		// debug_print_rhs(__LINE__);
 	}
-	sync_by_z();
 	#pragma omp parallel
 	{
 		x_solve();
-		// debug_print_rhs(__LINE__);
-		y_solve();
-		// debug_print_rhs(__LINE__);
-		z_solve();
-		// debug_print_rhs(__LINE__);
-		add();
-		// debug_print_rhs(__LINE__);
 	}
+	#pragma omp parallel
+	{
+		y_solve();
+	}
+
+	sync_alltoallv();
+
+	#pragma omp parallel
+	{
+		z_solve();
+	}
+	
+	sync_by_y();
+
+	add();
 }
 
 void compute_rhs(){
@@ -738,7 +816,7 @@ void compute_rhs(){
 		 */
 		j = 1;
 		if(in_block(j, range.by, range.ey)) {
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<5; m++){
 				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
 					(5.0*u[k][j][i][m]-4.0*u[k][j+1][i][m]+u[k][j+2][i][m]);
@@ -748,7 +826,7 @@ void compute_rhs(){
 
 		j = 2;
 		if(in_block(j, range.by, range.ey)) {
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m = 0; m < 5; m++) {
 				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp* 
 					(-4.0*u[k][j-1][i][m]+6.0*u[k][j][i][m]-
@@ -771,7 +849,7 @@ void compute_rhs(){
 
 		j=ny2-1;
 		if(in_block(j, range.by, range.ey)) {
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				for(m=0; m<5; m++){
 					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+ 
@@ -782,7 +860,7 @@ void compute_rhs(){
 
 		j=ny2;
 		if(in_block(j, range.by, range.ey)) {
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				for(m=0; m<5; m++){
 					rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 						(u[k][j-2][i][m]-4.0*u[k][j-1][i][m]+5.0*u[k][j][i][m]);
@@ -882,7 +960,7 @@ void compute_rhs(){
 	if(in_block(k, range.bz, range.ez)) {
 	#pragma omp for
 	for(j=1; j<=ny2; j++){
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<5; m++){
 				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+ 
@@ -896,7 +974,7 @@ void compute_rhs(){
 	if(in_block(k, range.bz, range.ez)) {
 	#pragma omp for
 	for(j=1; j<=ny2; j++){
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<5; m++){
 				rhs[k][j][i][m]=rhs[k][j][i][m]-dssp*
 					(u[k-2][j][i][m]-4.0*u[k-1][j][i][m]+5.0*u[k][j][i][m]);
@@ -905,8 +983,6 @@ void compute_rhs(){
 	}
 	}
 	if(timeron && thread_id==0){timer_stop(T_RHSZ);}
-
-	debug_print_rhs(__LINE__);
 
 	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
@@ -918,8 +994,6 @@ void compute_rhs(){
 			}
 		}
 	}
-
-	debug_print_rhs(__LINE__);
 
 	if(timeron && thread_id==0){timer_stop(T_RHS);}
 
@@ -1505,7 +1579,7 @@ void ninvr(){
 
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
 	int partition_size_z = 0, scale_z = nz2;
-	// partition(partition_size_z, range.bz, range.ez, scale_z);
+	partition(partition_size_z, range.bz, range.ez, scale_z);
 
 	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
@@ -1528,7 +1602,6 @@ void ninvr(){
 			}
 		}
 	}
-	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_NINVR);}
 }
@@ -1547,11 +1620,8 @@ void pinvr(){
 
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
 	int partition_size_z = 0, scale_z = nz2;
-	// partition(partition_size_z, range.bz, range.ez, scale_z);
+	partition(partition_size_z, range.bz, range.ez, scale_z);
 
-	/// Input:	rhs[1:nz2][1:ny2][1:nx2]
-	///			bt
-	/// Output:	rhs[1:nz2][1:ny2][1:nx2]
 	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
 		for(j=range.by; j<=range.ey; j++){
@@ -1571,7 +1641,6 @@ void pinvr(){
 			}
 		}
 	}
-	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_PINVR);}
 }
@@ -1835,7 +1904,6 @@ void txinvr(){
 			}
 		}
 	}
-	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_TXINVR);}
 }
@@ -1853,8 +1921,10 @@ void tzetar(){
 	if(timeron && thread_id==0){timer_start(T_TZETAR);}
 
 	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
-	int partition_size_z = 0, scale_z = nz2;
+	// int partition_size_z = 0, scale_z = nz2;
+	int partition_size_y = 0, scale_y = ny2;
 	// partition(partition_size_z, range.bz, range.ez, scale_z);
+	partition(partition_size_y, range.by, range.ey, scale_y);
 
 	#pragma omp for
 	for(k=range.bz; k<=range.ez; k++){
@@ -1885,7 +1955,6 @@ void tzetar(){
 			}
 		}
 	}
-	// sync_buffer(rhs, range.bz, range.ez, partition_size_z, 1, scale_z);
 
 	if(timeron && thread_id==0){timer_stop(T_TZETAR);}
 }
@@ -2207,14 +2276,18 @@ void x_solve(){
 
 	if(timeron && thread_id==0){timer_start(T_XSOLVE);}
 
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int pz = 0, sz = nz2;
+	partition(pz, range.bz, range.ez, sz);
+
 	#pragma omp for
-	for(k=1; k<=nz2; k++){
+	for(k=range.bz; k<=range.ez; k++){
 		double cv[PROBLEM_SIZE], rhon[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
 		double lhsm[IMAXP+1][IMAXP+1][5];
 
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			for(m=0; m<5; m++){
 				lhs[j][0][m]=0.0;
 				lhsp[j][0][m]=0.0;
@@ -2238,13 +2311,13 @@ void x_solve(){
 		 * first fill the lhs for the u-eigenvalue                   
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			for(i=0; i<=grid_points[0]-1; i++){
 				ru1=c3c4*rho_i[k][j][i];
 				cv[i]=us[k][j][i];
 				rhon[i]=max(max(dx2+con43*ru1,dx5+c1c5*ru1), max(dxmax+ru1,dx1));
 			}
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				lhs[j][i][0]=0.0;
 				lhs[j][i][1]=-dttx2*cv[i-1]-dttx1*rhon[i-1];
 				lhs[j][i][2]=1.0+c2dttx1*rhon[i];
@@ -2257,7 +2330,7 @@ void x_solve(){
 		 * add fourth order dissipation                             
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			i=1;
 			lhs[j][i][2]=lhs[j][i][2]+comz5;
 			lhs[j][i][3]=lhs[j][i][3]-comz4;
@@ -2267,7 +2340,7 @@ void x_solve(){
 			lhs[j][i+1][3]=lhs[j][i+1][3]-comz4;
 			lhs[j][i+1][4]=lhs[j][i+1][4]+comz1;
 		}
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			for(i=3; i<=grid_points[0]-4; i++){
 				lhs[j][i][0]=lhs[j][i][0]+comz1;
 				lhs[j][i][1]=lhs[j][i][1]-comz4;
@@ -2276,7 +2349,7 @@ void x_solve(){
 				lhs[j][i][4]=lhs[j][i][4]+comz1;
 			}
 		}
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			i=grid_points[0]-3;
 			lhs[j][i][0]=lhs[j][i][0]+comz1;
 			lhs[j][i][1]=lhs[j][i][1]-comz4;
@@ -2292,8 +2365,8 @@ void x_solve(){
 		 * the first  
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
-			for(i=1; i<=nx2; i++){
+		for(j=range.by; j<=range.ey; j++){
+			for(i=range.bx; i<=range.ex; i++){
 				lhsp[j][i][0]=lhs[j][i][0];
 				lhsp[j][i][1]=lhs[j][i][1]-dttx2*speed[k][j][i-1];
 				lhsp[j][i][2]=lhs[j][i][2];
@@ -2313,7 +2386,7 @@ void x_solve(){
 		 * perform the thomas algorithm; first, FORWARD ELIMINATION     
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			for(i=0; i<=grid_points[0]-3; i++){
 				i1=i+1;
 				i2=i+2;
@@ -2342,7 +2415,7 @@ void x_solve(){
 		 * elimination of off-diagonal entries
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			i=grid_points[0]-2;
 			i1=grid_points[0]-1;
 			fac1=1.0/lhs[j][i][2];
@@ -2371,7 +2444,7 @@ void x_solve(){
 		 * do the u+c and the u-c factors                 
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			for(i=0; i<=grid_points[0]-3; i++){
 				i1=i+1;
 				i2=i+2;
@@ -2404,7 +2477,7 @@ void x_solve(){
 		 * and again the last two rows separately
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			i=grid_points[0]-2;
 			i1=grid_points[0]-1;
 			m=3;
@@ -2436,7 +2509,7 @@ void x_solve(){
 		 * BACKSUBSTITUTION 
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			i=grid_points[0]-2;
 			i1=grid_points[0]-1;
 			for(m=0; m<3; m++){
@@ -2450,7 +2523,7 @@ void x_solve(){
 		 * the first three factors
 		 * ---------------------------------------------------------------------
 		 */
-		for(j=1; j<=ny2; j++){
+		for(j=range.by; j<=range.ey; j++){
 			for(i=grid_points[0]-3; i>=0; i--){
 				i1=i+1;
 				i2=i+2;
@@ -2495,15 +2568,20 @@ void y_solve(){
 	double ru1, fac1, fac2;
 	int thread_id = omp_get_thread_num();
 
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int pz = 0, sz = nz2;
+	partition(pz, range.bz, range.ez, sz);
+
 	if(timeron && thread_id==0){timer_start(T_YSOLVE);}
 	#pragma omp for
-	for(k=1; k<=grid_points[2]-2; k++){
+	// for(k=1; k<=grid_points[2]-2; k++){
+	for(k=range.bz; k<=range.ez; k++){
 		double cv[PROBLEM_SIZE], rhoq[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
 		double lhsm[IMAXP+1][IMAXP+1][5];
 
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<5; m++){
 				lhs[0][i][m]=0.0;
 				lhsp[0][i][m]=0.0;
@@ -2527,7 +2605,7 @@ void y_solve(){
 		 * first fill the lhs for the u-eigenvalue         
 		 * ---------------------------------------------------------------------
 		 */
-		for(i=1; i<=grid_points[0]-2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(j=0; j<=grid_points[1]-1; j++){
 				ru1=c3c4*rho_i[k][j][i];
 				cv[j]=vs[k][j][i];
@@ -2546,7 +2624,7 @@ void y_solve(){
 		 * add fourth order dissipation                             
 		 * ---------------------------------------------------------------------
 		 */
-		for(i=1; i<=grid_points[0]-2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			j=1;
 			lhs[j][i][2]=lhs[j][i][2]+comz5;
 			lhs[j][i][3]=lhs[j][i][3]-comz4;
@@ -2557,7 +2635,7 @@ void y_solve(){
 			lhs[j+1][i][4]=lhs[j+1][i][4]+comz1;
 		}
 		for(j=3; j<=grid_points[1]-4; j++){
-			for(i=1; i<=grid_points[0]-2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				lhs[j][i][0]=lhs[j][i][0]+comz1;
 				lhs[j][i][1]=lhs[j][i][1]-comz4;
 				lhs[j][i][2]=lhs[j][i][2]+comz6;
@@ -2565,7 +2643,7 @@ void y_solve(){
 				lhs[j][i][4]=lhs[j][i][4]+comz1;
 			}
 		}
-		for(i=1; i<=grid_points[0]-2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			j=grid_points[1]-3;
 			lhs[j][i][0]=lhs[j][i][0]+comz1;
 			lhs[j][i][1]=lhs[j][i][1]-comz4;
@@ -2581,7 +2659,7 @@ void y_solve(){
 		 * ---------------------------------------------------------------------
 		 */
 		for(j=1; j<=grid_points[1]-2; j++){
-			for(i=1; i<=grid_points[0]-2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				lhsp[j][i][0]=lhs[j][i][0];
 				lhsp[j][i][1]=lhs[j][i][1]-dtty2*speed[k][j-1][i];
 				lhsp[j][i][2]=lhs[j][i][2];
@@ -2602,7 +2680,7 @@ void y_solve(){
 		for(j=0; j<=grid_points[1]-3; j++){
 			j1=j+1;
 			j2=j+2;
-			for(i=1; i<=grid_points[0]-2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				fac1=1.0/lhs[j][i][2];
 				lhs[j][i][3]=fac1*lhs[j][i][3];
 				lhs[j][i][4]=fac1*lhs[j][i][4];
@@ -2630,7 +2708,7 @@ void y_solve(){
 		 */
 		j=grid_points[1]-2;
 		j1=grid_points[1]-1;
-		for(i=1; i<=grid_points[0]-2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			fac1=1.0/lhs[j][i][2];
 			lhs[j][i][3]=fac1*lhs[j][i][3];
 			lhs[j][i][4]=fac1*lhs[j][i][4];
@@ -2660,7 +2738,7 @@ void y_solve(){
 		for(j=0; j<=grid_points[1]-3; j++){
 			j1=j+1;
 			j2=j+2;
-			for(i=1; i<=grid_points[0]-2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				m=3;
 				fac1=1.0/lhsp[j][i][2];
 				lhsp[j][i][3]=fac1*lhsp[j][i][3];
@@ -2692,7 +2770,7 @@ void y_solve(){
 		 */
 		j=grid_points[1]-2;
 		j1=grid_points[1]-1;
-		for(i=1; i<=grid_points[0]-2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			m=3;
 			fac1=1.0/lhsp[j][i][2];
 			lhsp[j][i][3]=fac1*lhsp[j][i][3];
@@ -2724,7 +2802,7 @@ void y_solve(){
 		 */
 		j=grid_points[1]-2;
 		j1=grid_points[1]-1;
-		for(i=1; i<=grid_points[0]-2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<3; m++){
 				rhs[k][j][i][m]=rhs[k][j][i][m]-lhs[j][i][3]*rhs[k][j1][i][m];
 			}
@@ -2739,7 +2817,7 @@ void y_solve(){
 		for(j=grid_points[1]-3; j>=0; j--){
 			j1=j+1;
 			j2=j+2;
-			for(i=1; i<=grid_points[0]-2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				for(m=0; m<3; m++){
 					rhs[k][j][i][m]=rhs[k][j][i][m]- 
 						lhs[j][i][3]*rhs[k][j1][i][m]-
@@ -2775,16 +2853,21 @@ void z_solve(){
 	int i, j, k, k1, k2, m;
 	double ru1, fac1, fac2;
 	int thread_id = omp_get_thread_num();
+
+
+	MpiToolKit::BlockRange range(1, nx2, 1, ny2, 1, nz2);
+	int py = 0, sy = ny2;
+	partition(py, range.by, range.ez, sy);
 	
 	if(timeron && thread_id==0){timer_start(T_ZSOLVE);}
 	#pragma omp for
-	for(j=1; j<=ny2; j++){
+	for(j=range.by; j<=range.ey; j++){
 		double cv[PROBLEM_SIZE], rhos[PROBLEM_SIZE];
 		double lhs[IMAXP+1][IMAXP+1][5];
 		double lhsp[IMAXP+1][IMAXP+1][5];
 		double lhsm[IMAXP+1][IMAXP+1][5];
 
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<5; m++){
 				lhs[0][i][m]=0.0;
 				lhsp[0][i][m]=0.0;
@@ -2808,7 +2891,7 @@ void z_solve(){
 		 * first fill the lhs for the u-eigenvalue                          
 		 * ---------------------------------------------------------------------
 		 */
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(k=0; k<=nz2+1; k++){
 				ru1=c3c4*rho_i[k][j][i];
 				cv[k]=ws[k][j][i];
@@ -2827,7 +2910,7 @@ void z_solve(){
 		 * add fourth order dissipation                                  
 		 * ---------------------------------------------------------------------
 		 */
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			k=1;
 			lhs[k][i][2]=lhs[k][i][2]+comz5;
 			lhs[k][i][3]=lhs[k][i][3]-comz4;
@@ -2839,7 +2922,7 @@ void z_solve(){
 			lhs[k][i][4]=lhs[k][i][4]+comz1;
 		}
 		for(k=3; k<=nz2-2; k++){
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				lhs[k][i][0]=lhs[k][i][0]+comz1;
 				lhs[k][i][1]=lhs[k][i][1]-comz4;
 				lhs[k][i][2]=lhs[k][i][2]+comz6;
@@ -2847,7 +2930,7 @@ void z_solve(){
 				lhs[k][i][4]=lhs[k][i][4]+comz1;
 			}
 		}
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			k=nz2-1;
 			lhs[k][i][0]=lhs[k][i][0]+comz1;
 			lhs[k][i][1]=lhs[k][i][1]-comz4;
@@ -2864,7 +2947,7 @@ void z_solve(){
 		 * ---------------------------------------------------------------------
 		 */
 		for(k=1; k<=nz2; k++){
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				lhsp[k][i][0]=lhs[k][i][0];
 				lhsp[k][i][1]=lhs[k][i][1]-dttz2*speed[k-1][j][i];
 				lhsp[k][i][2]=lhs[k][i][2];
@@ -2885,7 +2968,7 @@ void z_solve(){
 		for(k=0; k<=grid_points[2]-3; k++){
 			k1=k+1;
 			k2=k+2;
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				fac1=1.0/lhs[k][i][2];
 				lhs[k][i][3]=fac1*lhs[k][i][3];
 				lhs[k][i][4]=fac1*lhs[k][i][4];
@@ -2913,7 +2996,7 @@ void z_solve(){
 		 */
 		k=grid_points[2]-2;
 		k1=grid_points[2]-1;
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			fac1=1.0/lhs[k][i][2];
 			lhs[k][i][3]=fac1*lhs[k][i][3];
 			lhs[k][i][4]=fac1*lhs[k][i][4];
@@ -2943,7 +3026,7 @@ void z_solve(){
 		for(k=0; k<=grid_points[2]-3; k++){
 			k1=k+1;
 			k2=k+2;
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				m=3;
 				fac1=1.0/lhsp[k][i][2];
 				lhsp[k][i][3]=fac1*lhsp[k][i][3];
@@ -2975,7 +3058,7 @@ void z_solve(){
 		 */
 		k=grid_points[2]-2;
 		k1=grid_points[2]-1;
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			m=3;
 			fac1=1.0/lhsp[k][i][2];
 			lhsp[k][i][3]=fac1*lhsp[k][i][3];
@@ -3008,7 +3091,7 @@ void z_solve(){
 		 */
 		k=grid_points[2]-2;
 		k1=grid_points[2]-1;
-		for(i=1; i<=nx2; i++){
+		for(i=range.bx; i<=range.ex; i++){
 			for(m=0; m<3; m++){
 				rhs[k][j][i][m]=rhs[k][j][i][m]-lhs[k][i][3]*rhs[k1][j][i][m];
 			}
@@ -3026,7 +3109,7 @@ void z_solve(){
 		for(k=grid_points[2]-3; k>=0; k--){
 			k1=k+1;
 			k2=k+2;
-			for(i=1; i<=nx2; i++){
+			for(i=range.bx; i<=range.ex; i++){
 				for (m = 0; m < 3; m++) {
 					rhs[k][j][i][m]=rhs[k][j][i][m]- 
 						lhs[k][i][3]*rhs[k1][j][i][m]-
