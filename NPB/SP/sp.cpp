@@ -60,6 +60,7 @@ Authors of the OpenMP code:
 #include "omp.h"
 #include "mpi.h"
 #include <string.h>
+// #include <vector>
 // #include <memory>
 
 #define IMAX PROBLEM_SIZE
@@ -197,19 +198,12 @@ inline void partition(int& partition_size, int& begin, int& end, int n) {
 
 template <typename array_t>
 inline void sync_buffer(array_t* buffer, int begin, int end, int partition_size, int start, int scale) {
-	if(getCommunicator().world_rank == 0) {
-		for(int i = 1; i < getCommunicator().world_size; i++) {
-			int recv_begin = block_begin(i, partition_size),
-				recv_size = (block_end(i, partition_size, scale) - recv_begin + 1) * sizeof(array_t) / sizeof(double);
-			MPI_Recv(&buffer[recv_begin], recv_size, MPI_DOUBLE, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-		}
-	} else {
-		intptr_t send_size = (end - begin + 1) * sizeof(array_t) / sizeof(double);
-		MPI_Send(&buffer[begin], send_size, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD);
+	for (int p = 0; p < getCommunicator().world_size; p++) {
+		int bcast_begin = block_begin(p, partition_size),
+			bcast_size = (block_end(p, partition_size, scale) - bcast_begin + 1) * sizeof(array_t) / sizeof(double);
+		
+		MPI_Bcast(&buffer[bcast_begin], bcast_size, MPI_DOUBLE, p, MPI_COMM_WORLD);
 	}
-
-	int buffer_size = scale * sizeof(array_t) / sizeof(double);
-	MPI_Bcast(&buffer[start], buffer_size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 }
 
 struct BlockRange {
@@ -234,7 +228,6 @@ static inline void block_z_run(const int k,
 		fn(args...);
 	}
 }
-
 template <typename Fn_, typename... Args>
 static inline void block_zy_run(const int k, const int j,
 							const BlockRange& range,
@@ -315,18 +308,33 @@ inline void sync_by_y() {
 	using MpiToolKit::block_begin;
 	using MpiToolKit::block_end;
 
+	double *sync_buffer = new double[nz2 * (block_end(0, py, sy) - block_begin(0, py) + 1) * (IMAXP + 1) * 5]; 
+
 	for (int p = 0; p < getCommunicator().world_size; p++) {
 		int begin_y = block_begin(p, py),
 			msg_size = (block_end(p, py, sy) - begin_y + 1) * (IMAXP + 1) * 5;
-	
-		debug_printf("by: %d, ey: %d, msg_size: %d\n", by, ey, msg_size);
 
-		for (int bkz = bz; bkz <= ez; bkz++) {
-			// debug_printf("[%d][%d] %.2lf\n", bkz, by, rhs[bkz][by][2][3]);
-			MPI_Bcast(&rhs[bkz][begin_y], msg_size, MPI_DOUBLE, p, MPI_COMM_WORLD);
+		int current_append = 0;
+		if(getCommunicator().world_rank == p) {
+			for (int bkz = bz; bkz <= ez; bkz++) {
+				memcpy(&sync_buffer[current_append], &rhs[bkz][begin_y], msg_size * sizeof(double));
+				current_append += msg_size;
+				// MPI_Bcast(&rhs[bkz][begin_y], msg_size, MPI_DOUBLE, p, MPI_COMM_WORLD);
+			}
 		}
+		// debug_printf("current append: %d\n", current_append);
+
+		MPI_Bcast(sync_buffer, nz2 * msg_size, MPI_DOUBLE, p, MPI_COMM_WORLD);
+
+		int current_recv = 0;
+		for (int bkz = bz; bkz <= ez; bkz++) {
+			memcpy(&rhs[bkz][begin_y], &sync_buffer[current_recv], msg_size * sizeof(double));
+			current_recv += msg_size;
+		}
+
 	}
 
+	delete[] sync_buffer;
 }
 
 inline void sync_alltoallv() {
@@ -338,42 +346,77 @@ inline void sync_alltoallv() {
 	using MpiToolKit::block_begin;
 	using MpiToolKit::block_end;
 
-	// double* tmp = new double[py * (IMAXP + 1) * 5];
-	MPI_Request* requests = new MPI_Request[getCommunicator().world_size];
+	double *send_buf = new double[pz * (JMAXP + 1) * (IMAXP + 1) * 5];
+	int current_append = 0;
+	int send_count[getCommunicator().world_size];
+	int send_disp[getCommunicator().world_size];
+
+
+	// debug_printf("======================================\n");
 
 	for(int p = 0; p < getCommunicator().world_size; p++) {
-		if (p == getCommunicator().world_rank) { 
-			requests[p] = MPI_REQUEST_NULL;
-			continue;
-		}
+		// if (p == getCommunicator().world_rank) { 
+		// 	requests[p] = MPI_REQUEST_NULL;
+		// 	continue;
+		// }
 		int begin_y = block_begin(p, py),
 			end_y = block_end(p, py, sy),
 			msg_size = (block_end(p, py, sy) - begin_y + 1) * (IMAXP + 1) * 5;
 
+		send_count[p] = msg_size * (ez - bz + 1);
+		send_disp[p] = (p == 0 ? 0 : send_disp[p - 1] + send_count[p - 1]);
+		// debug_printf("[%d] send_count[%d]: %d\n", getCommunicator().world_rank, p, send_count[p]);
 		// debug_printf("bz: %d, ez: %d, by: %d, ey: %d, msg_size: %d\n", bz, ez, begin_y, end_y, msg_size);
 		
 		// send
-		for (int bkz = bz; bkz<=ez; bkz++) {
-			MPI_Isend(&rhs[bkz][begin_y], msg_size, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[p]);
+		for (int bkz = bz; bkz <= ez; bkz++) {
+			memcpy(&send_buf[current_append], &rhs[bkz][begin_y], msg_size * sizeof(double));
+			// debug_printf("A[%d][%d](%.2lf){%.2lf}|current: %d|  ", bkz, begin_y, rhs[bkz][begin_y+1][2][3], send_buf[current_append+(IMAXP+1)*5 + 2*5+3], current_append);
+			current_append += msg_size;
+			// MPI_Isend(&rhs[bkz][begin_y], msg_size, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[p]);
 		}
 	}
+	// debug_printf("\ntotal_send: %d\n", current_append);
 
 	int msg_size = (ey - by + 1) * (IMAXP + 1) * 5;
+	// debug_printf("[%d]'s msg_size: %d\n", getCommunicator().world_rank, msg_size);
+	double *recv_buf = new double[msg_size * (sz + 1)];
+	int current_recv = 0;
+	int recv_count[getCommunicator().world_size];
+	int recv_disp[getCommunicator().world_size];
+	
 
 	for(int p = 0; p < getCommunicator().world_size; p++) {
-		if (p == getCommunicator().world_rank) { continue; }
+		// if (p == getCommunicator().world_rank) { continue; }
 		int recv_begin_z = block_begin(p, pz),
 			recv_end_z = block_end(p, pz, sz);
+		
+		recv_count[p] = msg_size * (recv_end_z - recv_begin_z + 1);
+		recv_disp[p] = (p == 0 ? 0 :recv_disp[p - 1] + recv_count[p - 1]);
+		// debug_printf("[%d] recv_count[%d]: %d\n", getCommunicator().world_rank, p, recv_count[p]);
 
 		// recv
+		// for (int bkz = recv_begin_z; bkz <= recv_end_z; bkz++) {
+		// 	MPI_Recv(&rhs[bkz][by], msg_size, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		// }
+	}
+	MPI_Alltoallv(send_buf, send_count, send_disp, MPI_DOUBLE, recv_buf, recv_count, recv_disp, MPI_DOUBLE, MPI_COMM_WORLD);
+	// MPI_Alltoall(send_buf, send_count[0], MPI_DOUBLE, recv_buf, recv_count[0], MPI_DOUBLE, MPI_COMM_WORLD);
+	for(int p = 0; p < getCommunicator().world_size; p++) {
+		int recv_begin_z = block_begin(p, pz),
+			recv_end_z = block_end(p, pz, sz);
 		for (int bkz = recv_begin_z; bkz <= recv_end_z; bkz++) {
-			MPI_Recv(&rhs[bkz][by], msg_size, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+			memcpy(&rhs[bkz][by], &recv_buf[current_recv], msg_size * sizeof(double));
+			// debug_printf("A[%d][%d](%.2lf){%.2lf}|current: %d|  ", bkz, by, rhs[bkz][by][2][3], recv_buf[current_recv + 2*5+3], current_recv);
+			current_recv += msg_size;
 		}
 	}
+	// debug_printf("\ntotal_recv: %d\n", current_recv);
 
-	MPI_Waitall(getCommunicator().world_size, requests, MPI_STATUS_IGNORE);
+	// debug_printf("\n");
 
-	delete[] requests;
+	delete[] send_buf;
+	delete[] recv_buf;
 }
 
 /* function prototypes */
@@ -602,6 +645,7 @@ void adi(){
 		y_solve();
 	}
 
+	#pragma master
 	sync_alltoallv();
 
 	#pragma omp parallel
